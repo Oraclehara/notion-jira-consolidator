@@ -99,10 +99,32 @@ def norm_status(prop: Dict[str, Any]) -> str:
     return norm_people_or_text(prop).strip()
 
 def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
+    """Return the first matching property by exact name, case/trim-insensitive name,
+    or (as a last resort) partial 'contains' matches."""
+    if not props:
+        return None
+
+    # 1) Exact name match
     for n in names:
         if n in props and props[n]:
             return props[n]
+
+    # 2) Case/trim-insensitive match
+    norm_map = { (k or "").strip().lower(): k for k in props.keys() }
+    for n in names:
+        k = norm_map.get((n or "").strip().lower())
+        if k and props.get(k):
+            return props[k]
+
+    # 3) Fuzzy contains match (e.g., 'status name', 'current status', etc.)
+    wanted = [s.strip().lower() for s in names if s]
+    for k in props.keys():
+        nk = (k or "").strip().lower()
+        if any(w in nk for w in wanted) and props.get(k):
+            return props[k]
+
     return None
+
 
 def norm_labels(prop: Dict[str, Any]) -> str:
     items: List[str] = []
@@ -309,6 +331,19 @@ class SyncRunner:
                     try:
                         props = r.get("properties", {})
                         last_edited = r.get("last_edited_time")
+                        
+                        # --- TEMP DEBUG: print property keys once per source to confirm naming ---
+                        if self.stats["fetched"] == 0:
+                            try:
+                                print("DEBUG property keys for source", src_db, ":", list(props.keys()))
+                                st_prop = prop_first(props, [
+                                    "Status", "Status (Jira)", "Issue Status", "State",
+                                    "Status name", "Status Name", "Jira Status", "Current status"
+                                ])
+                                print("DEBUG sample Status prop:", st_prop)
+                            except Exception as _e:
+                                print("DEBUG error while printing props:", _e)
+                        # --- END DEBUG ---
 
                         key = norm_key(norm_people_or_text(props.get("Key")))
                         if not key:
@@ -318,7 +353,19 @@ class SyncRunner:
                             "Key": key,
                             "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
                             "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
-                            "Status": enum_safe("Status", norm_status(prop_first(props, ["Status","Status (Jira)","Issue Status","State","Jira Status"]))),
+                            "Status": enum_safe("Status", norm_status(
+                                prop_first(props, [
+                                    "Status",
+                                    "Status (Jira)",
+                                    "Issue Status",
+                                    "State",
+                                    "Status name",
+                                    "Status Name",
+                                    "Jira Status",
+                                    "Current status"
+                                ])
+                            )),
+
                             "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
                             "Reporter": norm_people_or_text(prop_first(props, ["Reporter","Reported By","Creator"])),
                             "Assignee": norm_people_or_text(prop_first(props, ["Assignee","Owner","Assigned To"])),
