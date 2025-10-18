@@ -187,11 +187,10 @@ class SyncRunner:
         self.notion.page_update(row_id, {"Last Watermark (Date)": date(iso_str)})
 
     def consolidated_find_by_key(self, key: str) -> Optional[Dict[str, Any]]:
-    payload = {
-        "filter": {"property": "Key", "title": {"equals": key}},
-        "page_size": 1,
+        payload = {
+            "filter": {"property": "Key", "title": {"equals": key}},
+            "page_size": 1,
         }
-
         res = self.notion.db_query(self.consolidated_db, payload)
         results = res.get("results", [])
         return results[0] if results else None
