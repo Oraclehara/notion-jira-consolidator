@@ -275,7 +275,6 @@ class SyncRunner:
                     ],
                 }
 
-                }
                 if watermark:
                     payload["filter"] = {"property": "Updated", "date": {"on_or_after": watermark}}
                 if next_cursor:
