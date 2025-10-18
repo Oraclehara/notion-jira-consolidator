@@ -1,112 +1,339 @@
 #!/usr/bin/env python3
-props = r.get("properties", {})
-# Fallback last_edited_time if Updated missing
-last_edited = r.get("last_edited_time")
+# Notion-based Jira Consolidator (No Jira API) — clean copy
 
+import os, sys, time, json, hashlib, datetime as dt
+from typing import Dict, Any, List, Optional, Tuple
+import requests
 
-key = norm_key(norm_people_or_text(props.get("Key")))
-if not key:
-continue # skip rows with no key
+NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
+NOTION_API = "https://api.notion.com/v1"
+SESSION = requests.Session()
 
+class Notion:
+    def __init__(self, token: str):
+        self.h = {
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
+        }
 
-summary = norm_people_or_text(props.get("Summary") or props.get("Title"))
-issue_type = enum_safe("Issue Type", norm_people_or_text(props.get("Issue Type")))
-status = enum_safe("Status", norm_people_or_text(props.get("Status")))
-priority = enum_safe("Priority", norm_people_or_text(props.get("Priority")))
-reporter = norm_people_or_text(props.get("Reporter"))
-assignee = norm_people_or_text(props.get("Assignee"))
-sprint = norm_people_or_text(props.get("Sprint"))
-epic = norm_people_or_text(props.get("Epic Link"))
-parent = norm_people_or_text(props.get("Parent"))
-labels = norm_labels(props.get("Labels"))
-jira_url = norm_url(props.get("Jira URL"))
+    def _req(self, method: str, path: str, **kw) -> Dict[str, Any]:
+        url = f"{NOTION_API}{path}"
+        backoff = 1.0
+        for _ in range(8):
+            resp = SESSION.request(method, url, headers=self.h, timeout=40, **kw)
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", backoff))
+                time.sleep(max(retry_after, backoff))
+                backoff = min(backoff * 2, 30)
+                continue
+            if 500 <= resp.status_code < 600:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+            if not resp.ok:
+                raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text}")
+            return resp.json()
+        raise RuntimeError("Exceeded retry attempts against Notion API")
 
+    def db_query(self, db_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._req("POST", f"/databases/{db_id}/query", json=payload)
 
-created, _ = norm_date_prop(props.get("Created"))
-updated = extract_updated(props.get("Updated"), last_edited)
-resolved, _ = norm_date_prop(props.get("Resolved"))
-due, _ = norm_date_prop(props.get("Due date"))
-story_points = norm_number(props.get("Story Points"))
+    def page_retrieve(self, page_id: str) -> Dict[str, Any]:
+        return self._req("GET", f"/pages/{page_id}")
 
+    def page_update(self, page_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        return self._req("PATCH", f"/pages/{page_id}", json={"properties": properties})
 
-mapped = {
-"Key": key,
-"Summary": summary,
-"Issue Type": issue_type,
-"Status": status,
-"Priority": priority,
-"Reporter": reporter,
-"Assignee": assignee,
-"Sprint": sprint,
-"Epic Link": epic,
-"Parent": parent,
-"Labels": labels,
-"Jira URL": jira_url,
-"Created": created,
-"Updated": updated,
-"Resolved": resolved,
-"Due date": due,
-"Story Points": story_points,
+    def page_create(self, parent_db_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        return self._req("POST", "/pages", json={"parent": {"database_id": parent_db_id}, "properties": properties})
+
+# ---------- Normalization helpers ----------
+
+SAFE_ENUMS = {
+    "Issue Type": {"default": "Other", "map": {}},
+    "Status": {"default": "Unknown", "map": {}},
+    "Priority": {"default": "None", "map": {}},
 }
 
+MAPPED_FIELDS = [
+    "Key","Summary","Issue Type","Status","Priority",
+    "Reporter","Assignee","Sprint","Epic Link","Parent","Labels",
+    "Jira URL","Created","Updated","Resolved","Due date","Story Points"
+]
 
-# Track max watermark (string compare OK for ISO-8601)
-if updated:
-if self.new_watermark is None or updated > self.new_watermark:
-self.new_watermark = updated
+def norm_key(v: Any) -> str:
+    return str(v or "").strip().upper()
 
+def norm_people_or_text(prop: Dict[str, Any]) -> str:
+    if not prop: return ""
+    t = prop.get("type")
+    if t == "people":
+        names = []
+        for p in prop.get("people", []):
+            nm = p.get("name") or (p.get("person") or {}).get("email") or ""
+            if nm: names.append(nm)
+        return ", ".join(names)
+    if t == "rich_text":
+        return "".join(rt.get("plain_text","") for rt in prop.get("rich_text", [])).strip()
+    if t == "title":
+        return "".join(rt.get("plain_text","") for rt in prop.get("title", [])).strip()
+    if t == "select":
+        sel = prop.get("select")
+        return (sel or {}).get("name") or ""
+    return ""
 
-self.consolidated_upsert(mapped, src_db)
+def norm_labels(prop: Dict[str, Any]) -> str:
+    items: List[str] = []
+    if not prop: return ""
+    t = prop.get("type")
+    if t == "multi_select":
+        for it in prop.get("multi_select", []):
+            nm = (it or {}).get("name")
+            if nm: items.append(nm)
+    elif t in ("rich_text","title"):
+        txt = norm_people_or_text(prop)
+        if txt:
+            rough = []
+            for chunk in txt.split(";"):
+                rough += chunk.split(",")
+            for r in rough:
+                nm = r.strip()
+                if nm: items.append(nm)
+    items = sorted(set(x.strip().lower() for x in items if x and x.strip()))
+    return ", ".join(items)
 
+def norm_date_prop(prop: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+    if not prop or prop.get("type") != "date": return (None, False)
+    d = prop.get("date") or {}
+    start = d.get("start")
+    if not start: return (None, False)
+    return start, ("T" in start)
 
-# batch pacing
-if (self.stats["created"] + self.stats["updated"]) % self.batch_size == 0:
-time.sleep(self.sleep_secs)
+def norm_number(prop: Dict[str, Any]) -> Optional[float]:
+    if not prop or prop.get("type") != "number": return None
+    return prop.get("number")
 
+def norm_url(prop: Dict[str, Any]) -> str:
+    if not prop: return ""
+    if prop.get("type") == "url": return prop.get("url") or ""
+    return norm_people_or_text(prop)
 
-except Exception as e:
-self.stats["errors"] += 1
-print(f"ERROR key?={props.get('Key') if 'props' in locals() else '?'} reason={e}")
+def enum_safe(name: str, value: str) -> str:
+    conf = SAFE_ENUMS.get(name)
+    if not conf: return value
+    m = conf.get("map", {})
+    return m.get(value, value or conf.get("default",""))
 
+def compute_source_hash(mapped: Dict[str, Any]) -> str:
+    order = MAPPED_FIELDS
+    s = "\u241f".join(str(mapped.get(k,"")) for k in order)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-if not has_more:
-break
+def extract_updated(prop: Dict[str, Any], fallback_last_edited_time: Optional[str]) -> Optional[str]:
+    val, _ = norm_date_prop(prop)
+    return val or fallback_last_edited_time
 
+# ---------- Notion property builders ----------
 
-# Update watermark if we progressed (not on full-scan with no updates)
-if self.new_watermark:
-self.set_watermark(self.new_watermark)
+def rich(v: str) -> Dict[str, Any]:
+    return {"rich_text": [{"type": "text", "text": {"content": v[:2000]}}]} if v else {"rich_text": []}
 
+def title(v: str) -> Dict[str, Any]:
+    return {"title": [{"type": "text", "text": {"content": v[:2000]}}]} if v else {"title": []}
 
-# Summary
-print(json.dumps({
-"fetched": self.stats["fetched"],
-"created": self.stats["created"],
-"updated": self.stats["updated"],
-"skipped": self.stats["skipped"],
-"errors": self.stats["errors"],
-"new_watermark": self.new_watermark,
-}, indent=2))
+def sel(v: str) -> Dict[str, Any]:
+    return {"select": {"name": v}} if v else {"select": None}
 
+def url(v: str) -> Dict[str, Any]:
+    return {"url": v or None}
 
+def num(v: Optional[float]) -> Dict[str, Any]:
+    return {"number": v}
 
+def date(v: Optional[str]) -> Dict[str, Any]:
+    return {"date": {"start": v}} if v else {"date": None}
+
+class SyncRunner:
+    def __init__(self, notion: Notion, consolidated_db: str, sync_control_db: str, source_db_ids: List[str]):
+        self.notion = notion
+        self.consolidated_db = consolidated_db
+        self.sync_control_db = sync_control_db
+        self.source_db_ids = source_db_ids
+        self.max_pages = int(os.getenv("MAX_PAGES_PER_RUN", "50"))
+        self.page_size = int(os.getenv("PAGE_SIZE", "100"))
+        self.batch_size = int(os.getenv("BATCH_SIZE", "10"))
+        self.sleep_secs = float(os.getenv("SLEEP_SECS", "0.4"))
+        self.stats = {"fetched":0,"created":0,"updated":0,"skipped":0,"errors":0}
+        self.new_watermark: Optional[str] = None
+
+    # We store the watermark in a tiny DB (first row)
+    def _get_control_row_id_and_value(self) -> Tuple[Optional[str], Optional[str]]:
+        res = self.notion.db_query(self.sync_control_db, {"page_size": 1})
+        rows = res.get("results", [])
+        if not rows:
+            # create one row if empty
+            created = self.notion.page_create(self.sync_control_db, {"Name": title("Main Control")})
+            rows = [created]
+        row = rows[0]
+        props = row.get("properties", {})
+        lw = props.get("Last Watermark (Date)")
+        iso_val = None
+        if lw and lw.get("type") == "date" and lw.get("date"):
+            iso_val = lw["date"].get("start")
+        return row["id"], iso_val
+
+    def _set_control_value(self, row_id: str, iso_str: Optional[str]):
+        self.notion.page_update(row_id, {"Last Watermark (Date)": date(iso_str)})
+
+    def consolidated_find_by_key(self, key: str) -> Optional[Dict[str, Any]]:
+        payload = {
+            "filter": {"property": "Key", "title": {"equals": key}},
+            "page_size": 1,
+            "filter_properties": ["Key","Source Hash"],
+        }
+        res = self.notion.db_query(self.consolidated_db, payload)
+        results = res.get("results", [])
+        return results[0] if results else None
+
+    def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
+        src_hash = compute_source_hash(mapped)
+        props = {
+            "Key": title(mapped["Key"]),
+            "Summary": rich(mapped.get("Summary","")),
+            "Issue Type": sel(mapped.get("Issue Type","")),
+            "Status": sel(mapped.get("Status","")),
+            "Priority": sel(mapped.get("Priority","")),
+            "Reporter": rich(mapped.get("Reporter","")),
+            "Assignee": rich(mapped.get("Assignee","")),
+            "Sprint": rich(mapped.get("Sprint","")),
+            "Epic Link": rich(mapped.get("Epic Link","")),
+            "Parent": rich(mapped.get("Parent","")),
+            "Labels": rich(mapped.get("Labels","")),
+            "Jira URL": url(mapped.get("Jira URL","")),
+            "Created": date(mapped.get("Created")),
+            "Updated": date(mapped.get("Updated")),
+            "Resolved": date(mapped.get("Resolved")),
+            "Due date": date(mapped.get("Due date")),
+            "Story Points": num(mapped.get("Story Points")),
+            "Source Hash": rich(src_hash),
+            "Source Database": rich(src_db_id),
+        }
+        current = self.consolidated_find_by_key(mapped["Key"])
+        if current is None:
+            self.notion.page_create(self.consolidated_db, props)
+            self.stats["created"] += 1
+        else:
+            cur_hash = ""
+            try:
+                prop = current.get("properties", {}).get("Source Hash", {})
+                cur_hash = "".join(t.get("plain_text","") for t in prop.get("rich_text", []))
+            except Exception:
+                cur_hash = ""
+            if cur_hash == src_hash:
+                self.stats["skipped"] += 1
+            else:
+                self.notion.page_update(current["id"], props)
+                self.stats["updated"] += 1
+
+    def _should_full_scan(self) -> bool:
+        if os.getenv("FORCE_FULL_SCAN"):
+            return True
+        return dt.datetime.utcnow().weekday() == int(os.getenv("FULL_SCAN_WEEKDAY", "6"))
+
+    def run(self):
+        control_row_id, watermark = self._get_control_row_id_and_value()
+        if self._should_full_scan():
+            watermark = None
+
+        for src_db in self.source_db_ids:
+            next_cursor = None
+            while True:
+                if self.stats["fetched"] >= self.max_pages:
+                    break
+                payload: Dict[str, Any] = {
+                    "page_size": self.page_size,
+                    "filter_properties": MAPPED_FIELDS,
+                }
+                if watermark:
+                    payload["filter"] = {"property": "Updated", "date": {"on_or_after": watermark}}
+                if next_cursor:
+                    payload["start_cursor"] = next_cursor
+
+                data = self.notion.db_query(src_db, payload)
+                results = data.get("results", [])
+                next_cursor = data.get("next_cursor")
+                has_more = data.get("has_more", False)
+
+                for r in results:
+                    self.stats["fetched"] += 1
+                    try:
+                        props = r.get("properties", {})
+                        last_edited = r.get("last_edited_time")
+
+                        key = norm_key(norm_people_or_text(props.get("Key")))
+                        if not key:
+                            continue
+
+                        mapped = {
+                            "Key": key,
+                            "Summary": norm_people_or_text(props.get("Summary") or props.get("Title")),
+                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(props.get("Issue Type"))),
+                            "Status": enum_safe("Status", norm_people_or_text(props.get("Status"))),
+                            "Priority": enum_safe("Priority", norm_people_or_text(props.get("Priority"))),
+                            "Reporter": norm_people_or_text(props.get("Reporter")),
+                            "Assignee": norm_people_or_text(props.get("Assignee")),
+                            "Sprint": norm_people_or_text(props.get("Sprint")),
+                            "Epic Link": norm_people_or_text(props.get("Epic Link")),
+                            "Parent": norm_people_or_text(props.get("Parent")),
+                            "Labels": norm_labels(props.get("Labels")),
+                            "Jira URL": norm_url(props.get("Jira URL")),
+                            "Created": norm_date_prop(props.get("Created"))[0],
+                            "Updated": extract_updated(props.get("Updated"), last_edited),
+                            "Resolved": norm_date_prop(props.get("Resolved"))[0],
+                            "Due date": norm_date_prop(props.get("Due date"))[0],
+                            "Story Points": norm_number(props.get("Story Points")),
+                        }
+
+                        if mapped["Updated"]:
+                            if self.new_watermark is None or mapped["Updated"] > self.new_watermark:
+                                self.new_watermark = mapped["Updated"]
+
+                        self.consolidated_upsert(mapped, src_db)
+
+                        if (self.stats["created"] + self.stats["updated"]) % self.batch_size == 0:
+                            time.sleep(self.sleep_secs)
+
+                    except Exception as e:
+                        self.stats["errors"] += 1
+                        print(f"ERROR key={props.get('Key') if 'props' in locals() else '?'} reason={e}")
+
+                if not has_more:
+                    break
+
+        if self.new_watermark and control_row_id:
+            self._set_control_value(control_row_id, self.new_watermark)
+
+        print(json.dumps({
+            "fetched": self.stats["fetched"],
+            "created": self.stats["created"],
+            "updated": self.stats["updated"],
+            "skipped": self.stats["skipped"],
+            "errors": self.stats["errors"],
+            "new_watermark": self.new_watermark,
+        }, indent=2))
 
 def main():
-token = os.getenv("NOTION_TOKEN")
-consolidated = os.getenv("CONSOLIDATED_DB_ID")
-control_page = os.getenv("SYNC_CONTROL_PAGE_ID")
-sources_csv = os.getenv("SOURCE_DB_IDS", "")
-if not token or not consolidated or not control_page or not sources_csv:
-print("Missing required env vars: NOTION_TOKEN, CONSOLIDATED_DB_ID, SYNC_CONTROL_PAGE_ID, SOURCE_DB_IDS", file=sys.stderr)
-sys.exit(2)
-
-
-sources = [s.strip() for s in sources_csv.split(",") if s.strip()]
-client = Notion(token)
-SyncRunner(client, consolidated, control_page, sources).run()
-
-
-
+    token = os.getenv("NOTION_TOKEN")
+    consolidated = os.getenv("CONSOLIDATED_DB_ID")
+    control_db = os.getenv("SYNC_CONTROL_PAGE_ID")  # using the inline DB id
+    sources_csv = os.getenv("SOURCE_DB_IDS", "")
+    if not token or not consolidated or not control_db or not sources_csv:
+        print("Missing required env vars: NOTION_TOKEN, CONSOLIDATED_DB_ID, SYNC_CONTROL_PAGE_ID, SOURCE_DB_IDS", file=sys.stderr)
+        sys.exit(2)
+    sources = [s.strip() for s in sources_csv.split(",") if s.strip()]
+    client = Notion(token)
+    SyncRunner(client, consolidated, control_db, sources).run()
 
 if __name__ == "__main__":
-main()
+    main()
