@@ -42,4 +42,5 @@ jobs:
           BATCH_SIZE: ${{ vars.BATCH_SIZE || 10 }}
           SLEEP_SECS: ${{ vars.SLEEP_SECS || 0.4 }}
           FULL_SCAN_WEEKDAY: ${{ vars.FULL_SCAN_WEEKDAY || 6 }}
+          FORCE_FULL_SCAN: ${{ vars.FORCE_FULL_SCAN || '' }}
         run: python scripts/sync_jira_notionsrc.py
