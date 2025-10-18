@@ -134,6 +134,13 @@ def extract_updated(prop: Dict[str, Any], fallback_last_edited_time: Optional[st
     val, _ = norm_date_prop(prop)
     return val or fallback_last_edited_time
 
+def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
+    for n in names:
+        if n in props and props[n]:
+            return props[n]
+    return None
+
+
 # ---------- Notion property builders ----------
 
 def rich(v: str) -> Dict[str, Any]:
@@ -260,8 +267,14 @@ class SyncRunner:
             while True:
                 if self.stats["fetched"] >= self.max_pages:
                     break
-                payload: Dict[str, Any] = {
+                 payload: Dict[str, Any] = {
                     "page_size": self.page_size,
+                    "sorts": [
+                        {"property": "Updated", "direction": "descending"},
+                        {"timestamp": "last_edited_time", "direction": "descending"},
+                    ],
+                }
+
                 }
                 if watermark:
                     payload["filter"] = {"property": "Updated", "date": {"on_or_after": watermark}}
@@ -285,22 +298,58 @@ class SyncRunner:
 
                         mapped = {
                             "Key": key,
-                            "Summary": norm_people_or_text(props.get("Summary") or props.get("Title")),
-                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(props.get("Issue Type"))),
-                            "Status": enum_safe("Status", norm_people_or_text(props.get("Status"))),
-                            "Priority": enum_safe("Priority", norm_people_or_text(props.get("Priority"))),
-                            "Reporter": norm_people_or_text(props.get("Reporter")),
-                            "Assignee": norm_people_or_text(props.get("Assignee")),
-                            "Sprint": norm_people_or_text(props.get("Sprint")),
-                            "Epic Link": norm_people_or_text(props.get("Epic Link")),
-                            "Parent": norm_people_or_text(props.get("Parent")),
-                            "Labels": norm_labels(props.get("Labels")),
-                            "Jira URL": norm_url(props.get("Jira URL")),
-                            "Created": norm_date_prop(props.get("Created"))[0],
-                            "Updated": extract_updated(props.get("Updated"), last_edited),
-                            "Resolved": norm_date_prop(props.get("Resolved"))[0],
-                            "Due date": norm_date_prop(props.get("Due date"))[0],
-                            "Story Points": norm_number(props.get("Story Points")),
+                            "Summary": norm_people_or_text(
+                                prop_first(props, ["Summary","Title","Issue summary","Name"])
+                            ),
+                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(
+                                prop_first(props, ["Issue Type","Type","Issue type"])
+                            )),
+                            "Status": enum_safe("Status", norm_people_or_text(
+                                prop_first(props, ["Status","Status (Jira)","Issue Status","State"])
+                            )),
+                            "Priority": enum_safe("Priority", norm_people_or_text(
+                                prop_first(props, ["Priority","Issue Priority"])
+                            )),
+                            "Reporter": norm_people_or_text(
+                                prop_first(props, ["Reporter","Reported By","Creator"])
+                            ),
+                            "Assignee": norm_people_or_text(
+                                prop_first(props, ["Assignee","Owner","Assigned To"])
+                            ),
+                            "Sprint": norm_people_or_text(
+                                prop_first(props, ["Sprint","Iteration","Milestone"])
+                            ),
+                            "Epic Link": norm_people_or_text(
+                                prop_first(props, ["Epic Link","Epic","Parent Epic"])
+                            ),
+                            "Parent": norm_people_or_text(
+                                prop_first(props, ["Parent","Parent Issue"])
+                            ),
+                            "Labels": norm_labels(
+                                prop_first(props, ["Labels","Label","Tags"])
+                            ),
+                            "Jira URL": norm_url(
+                                prop_first(props, ["Jira URL","URL","Link"])
+                            ),
+                            "Created": norm_date_prop(
+                                prop_first(props, ["Created","Created time","Created Time"])
+                            )[0],
+                            "Updated": extract_updated(
+                                prop_first(props, ["Updated","Updated time","Last Updated"]),
+                                last_edited
+                            ),
+                            "Resolved": norm_date_prop(
+                                prop_first(props, ["Resolved","Resolution date"])
+                            )[0],
+                            "Due date": norm_date_prop(
+                                prop_first(props, ["Due date","Due Date","Due"])
+                            )[0],
+                            "Story Points": norm_number(
+                                prop_first(props, ["Story Points","Points","SP"])
+                            ),
+                        }
+
+
                         }
 
                         if mapped["Updated"]:
