@@ -267,7 +267,8 @@ class SyncRunner:
             while True:
                 if self.stats["fetched"] >= self.max_pages:
                     break
-                 payload: Dict[str, Any] = {
+
+                payload: Dict[str, Any] = {
                     "page_size": self.page_size,
                     "sorts": [
                         {"property": "Updated", "direction": "descending"},
@@ -276,7 +277,11 @@ class SyncRunner:
                 }
 
                 if watermark:
-                    payload["filter"] = {"property": "Updated", "date": {"on_or_after": watermark}}
+                    payload["filter"] = {
+                        "property": "Updated",
+                        "date": {"on_or_after": watermark}
+                    }
+
                 if next_cursor:
                     payload["start_cursor"] = next_cursor
 
