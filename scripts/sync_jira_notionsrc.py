@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — enhanced for status-type fields
+# Notion-based Jira Consolidator (No Jira API) — status-safe version
 
 import os, sys, time, json, hashlib, datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
@@ -54,7 +54,8 @@ class Notion:
 
 SAFE_ENUMS = {
     "Issue Type": {"default": "Other", "map": {}},
-    "Status": {"default": "Unknown", "map": {}},
+    # leave blank if we can't detect it; don't overwrite with "Unknown"
+    "Status": {"default": "", "map": {}},
     "Priority": {"default": "None", "map": {}},
 }
 
@@ -99,32 +100,23 @@ def norm_status(prop: Dict[str, Any]) -> str:
     return norm_people_or_text(prop).strip()
 
 def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
-    """Return the first matching property by exact name, case/trim-insensitive name,
-    or (as a last resort) partial 'contains' matches."""
+    """First matching property: exact → case/trim-insensitive → fuzzy contains."""
     if not props:
         return None
-
-    # 1) Exact name match
     for n in names:
         if n in props and props[n]:
             return props[n]
-
-    # 2) Case/trim-insensitive match
     norm_map = { (k or "").strip().lower(): k for k in props.keys() }
     for n in names:
         k = norm_map.get((n or "").strip().lower())
         if k and props.get(k):
             return props[k]
-
-    # 3) Fuzzy contains match (e.g., 'status name', 'current status', etc.)
     wanted = [s.strip().lower() for s in names if s]
     for k in props.keys():
         nk = (k or "").strip().lower()
         if any(w in nk for w in wanted) and props.get(k):
             return props[k]
-
     return None
-
 
 def norm_labels(prop: Dict[str, Any]) -> str:
     items: List[str] = []
@@ -187,6 +179,9 @@ def title(v: str) -> Dict[str, Any]:
 
 def sel(v: str) -> Dict[str, Any]:
     return {"select": {"name": v}} if v else {"select": None}
+
+def status_prop(v: Optional[str]) -> Dict[str, Any]:
+    return {"status": {"name": v}} if v else {"status": None}
 
 def url(v: str) -> Dict[str, Any]:
     return {"url": v or None}
@@ -253,7 +248,6 @@ class SyncRunner:
             "Key": title(mapped["Key"]),
             "Summary": rich(mapped.get("Summary","")),
             "Issue Type": sel(mapped.get("Issue Type","")),
-            "Status": sel(mapped.get("Status","")),
             "Priority": sel(mapped.get("Priority","")),
             "Reporter": rich(mapped.get("Reporter","")),
             "Assignee": rich(mapped.get("Assignee","")),
@@ -270,6 +264,10 @@ class SyncRunner:
             "Source Hash": rich(src_hash),
             "Source Database": rich(src_db_id),
         }
+
+        # Only set Status if we actually resolved a value, and use the Status-type payload
+        if mapped.get("Status"):
+            props["Status"] = status_prop(mapped["Status"])
 
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
@@ -331,19 +329,10 @@ class SyncRunner:
                     try:
                         props = r.get("properties", {})
                         last_edited = r.get("last_edited_time")
-                        
-                        # --- TEMP DEBUG: print property keys once per source to confirm naming ---
-                        if self.stats["fetched"] == 0:
-                            try:
-                                print("DEBUG property keys for source", src_db, ":", list(props.keys()))
-                                st_prop = prop_first(props, [
-                                    "Status", "Status (Jira)", "Issue Status", "State",
-                                    "Status name", "Status Name", "Jira Status", "Current status"
-                                ])
-                                print("DEBUG sample Status prop:", st_prop)
-                            except Exception as _e:
-                                print("DEBUG error while printing props:", _e)
-                        # --- END DEBUG ---
+
+                        # --- Optional DEBUG (prints once per source) ---
+                        # if self.stats["fetched"] == 1:
+                        #     print("DEBUG property keys for source", src_db, ":", list(props.keys()))
 
                         key = norm_key(norm_people_or_text(props.get("Key")))
                         if not key:
@@ -362,10 +351,10 @@ class SyncRunner:
                                     "Status name",
                                     "Status Name",
                                     "Jira Status",
-                                    "Current status"
+                                    "Current status",
+                                    "Workflow State",
                                 ])
                             )),
-
                             "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
                             "Reporter": norm_people_or_text(prop_first(props, ["Reporter","Reported By","Creator"])),
                             "Assignee": norm_people_or_text(prop_first(props, ["Assignee","Owner","Assigned To"])),
