@@ -154,6 +154,16 @@ def num(v: Optional[float]) -> Dict[str, Any]:
 def date(v: Optional[str]) -> Dict[str, Any]:
     return {"date": {"start": v}} if v else {"date": None}
 
+def ms(csv_text: Optional[str]) -> Dict[str, Any]:
+    vals = []
+    if csv_text:
+        for part in csv_text.split(","):
+            name = part.strip()
+            if name:
+                vals.append({"name": name})
+    return {"multi_select": vals}
+
+
 class SyncRunner:
     def __init__(self, notion: Notion, consolidated_db: str, sync_control_db: str, source_db_ids: List[str]):
         self.notion = notion
@@ -208,7 +218,7 @@ class SyncRunner:
             "Sprint": rich(mapped.get("Sprint","")),
             "Epic Link": rich(mapped.get("Epic Link","")),
             "Parent": rich(mapped.get("Parent","")),
-            "Labels": rich(mapped.get("Labels","")),
+            "Labels": ms(mapped.get("Labels","")),
             "Jira URL": url(mapped.get("Jira URL","")),
             "Created": date(mapped.get("Created")),
             "Updated": date(mapped.get("Updated")),
