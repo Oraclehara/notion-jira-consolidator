@@ -353,9 +353,6 @@ class SyncRunner:
                             ),
                         }
 
-
-                        }
-
                         if mapped["Updated"]:
                             if self.new_watermark is None or mapped["Updated"] > self.new_watermark:
                                 self.new_watermark = mapped["Updated"]
