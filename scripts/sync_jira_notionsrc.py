@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — clean copy
+# Notion-based Jira Consolidator (No Jira API) — enhanced for status-type fields
 
 import os, sys, time, json, hashlib, datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
@@ -8,6 +8,8 @@ import requests
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
 NOTION_API = "https://api.notion.com/v1"
 SESSION = requests.Session()
+
+# ---------- Notion API Wrapper ----------
 
 class Notion:
     def __init__(self, token: str):
@@ -48,7 +50,7 @@ class Notion:
     def page_create(self, parent_db_id: str, properties: Dict[str, Any]) -> Dict[str, Any]:
         return self._req("POST", "/pages", json={"parent": {"database_id": parent_db_id}, "properties": properties})
 
-# ---------- Normalization helpers ----------
+# ---------- Normalization Helpers ----------
 
 SAFE_ENUMS = {
     "Issue Type": {"default": "Other", "map": {}},
@@ -57,9 +59,9 @@ SAFE_ENUMS = {
 }
 
 MAPPED_FIELDS = [
-    "Key","Summary","Issue Type","Status","Priority",
-    "Reporter","Assignee","Sprint","Epic Link","Parent","Labels",
-    "Jira URL","Created","Updated","Resolved","Due date","Story Points"
+    "Key", "Summary", "Issue Type", "Status", "Priority",
+    "Reporter", "Assignee", "Sprint", "Epic Link", "Parent", "Labels",
+    "Jira URL", "Created", "Updated", "Resolved", "Due date", "Story Points"
 ]
 
 def norm_key(v: Any) -> str:
@@ -82,6 +84,25 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
         sel = prop.get("select")
         return (sel or {}).get("name") or ""
     return ""
+
+def norm_status(prop: Dict[str, Any]) -> str:
+    """Support both Notion 'status' and 'select' fields."""
+    if not prop:
+        return ""
+    t = prop.get("type")
+    if t == "status":
+        st = prop.get("status") or {}
+        return (st.get("name") or "").strip()
+    if t == "select":
+        sel = prop.get("select") or {}
+        return (sel.get("name") or "").strip()
+    return norm_people_or_text(prop).strip()
+
+def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
+    for n in names:
+        if n in props and props[n]:
+            return props[n]
+    return None
 
 def norm_labels(prop: Dict[str, Any]) -> str:
     items: List[str] = []
@@ -134,14 +155,7 @@ def extract_updated(prop: Dict[str, Any], fallback_last_edited_time: Optional[st
     val, _ = norm_date_prop(prop)
     return val or fallback_last_edited_time
 
-def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
-    for n in names:
-        if n in props and props[n]:
-            return props[n]
-    return None
-
-
-# ---------- Notion property builders ----------
+# ---------- Notion Property Builders ----------
 
 def rich(v: str) -> Dict[str, Any]:
     return {"rich_text": [{"type": "text", "text": {"content": v[:2000]}}]} if v else {"rich_text": []}
@@ -170,6 +184,7 @@ def ms(csv_text: Optional[str]) -> Dict[str, Any]:
                 vals.append({"name": name})
     return {"multi_select": vals}
 
+# ---------- Sync Logic ----------
 
 class SyncRunner:
     def __init__(self, notion: Notion, consolidated_db: str, sync_control_db: str, source_db_ids: List[str]):
@@ -184,12 +199,10 @@ class SyncRunner:
         self.stats = {"fetched":0,"created":0,"updated":0,"skipped":0,"errors":0}
         self.new_watermark: Optional[str] = None
 
-    # We store the watermark in a tiny DB (first row)
     def _get_control_row_id_and_value(self) -> Tuple[Optional[str], Optional[str]]:
         res = self.notion.db_query(self.sync_control_db, {"page_size": 1})
         rows = res.get("results", [])
         if not rows:
-            # create one row if empty
             created = self.notion.page_create(self.sync_control_db, {"Name": title("Main Control")})
             rows = [created]
         row = rows[0]
@@ -235,6 +248,7 @@ class SyncRunner:
             "Source Hash": rich(src_hash),
             "Source Database": rich(src_db_id),
         }
+
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
             self.notion.page_create(self.consolidated_db, props)
@@ -302,55 +316,22 @@ class SyncRunner:
 
                         mapped = {
                             "Key": key,
-                            "Summary": norm_people_or_text(
-                                prop_first(props, ["Summary","Title","Issue summary","Name"])
-                            ),
-                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(
-                                prop_first(props, ["Issue Type","Type","Issue type"])
-                            )),
-                            "Status": enum_safe("Status", norm_people_or_text(
-                                prop_first(props, ["Status","Status (Jira)","Issue Status","State"])
-                            )),
-                            "Priority": enum_safe("Priority", norm_people_or_text(
-                                prop_first(props, ["Priority","Issue Priority"])
-                            )),
-                            "Reporter": norm_people_or_text(
-                                prop_first(props, ["Reporter","Reported By","Creator"])
-                            ),
-                            "Assignee": norm_people_or_text(
-                                prop_first(props, ["Assignee","Owner","Assigned To"])
-                            ),
-                            "Sprint": norm_people_or_text(
-                                prop_first(props, ["Sprint","Iteration","Milestone"])
-                            ),
-                            "Epic Link": norm_people_or_text(
-                                prop_first(props, ["Epic Link","Epic","Parent Epic"])
-                            ),
-                            "Parent": norm_people_or_text(
-                                prop_first(props, ["Parent","Parent Issue"])
-                            ),
-                            "Labels": norm_labels(
-                                prop_first(props, ["Labels","Label","Tags"])
-                            ),
-                            "Jira URL": norm_url(
-                                prop_first(props, ["Jira URL","URL","Link"])
-                            ),
-                            "Created": norm_date_prop(
-                                prop_first(props, ["Created","Created time","Created Time"])
-                            )[0],
-                            "Updated": extract_updated(
-                                prop_first(props, ["Updated","Updated time","Last Updated"]),
-                                last_edited
-                            ),
-                            "Resolved": norm_date_prop(
-                                prop_first(props, ["Resolved","Resolution date"])
-                            )[0],
-                            "Due date": norm_date_prop(
-                                prop_first(props, ["Due date","Due Date","Due"])
-                            )[0],
-                            "Story Points": norm_number(
-                                prop_first(props, ["Story Points","Points","SP"])
-                            ),
+                            "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
+                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
+                            "Status": enum_safe("Status", norm_status(prop_first(props, ["Status","Status (Jira)","Issue Status","State","Jira Status"]))),
+                            "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
+                            "Reporter": norm_people_or_text(prop_first(props, ["Reporter","Reported By","Creator"])),
+                            "Assignee": norm_people_or_text(prop_first(props, ["Assignee","Owner","Assigned To"])),
+                            "Sprint": norm_people_or_text(prop_first(props, ["Sprint","Iteration","Milestone"])),
+                            "Epic Link": norm_people_or_text(prop_first(props, ["Epic Link","Epic","Parent Epic"])),
+                            "Parent": norm_people_or_text(prop_first(props, ["Parent","Parent Issue"])),
+                            "Labels": norm_labels(prop_first(props, ["Labels","Label","Tags"])),
+                            "Jira URL": norm_url(prop_first(props, ["Jira URL","URL","Link"])),
+                            "Created": norm_date_prop(prop_first(props, ["Created","Created time","Created Time"]))[0],
+                            "Updated": extract_updated(prop_first(props, ["Updated","Updated time","Last Updated"]), last_edited),
+                            "Resolved": norm_date_prop(prop_first(props, ["Resolved","Resolution date"]))[0],
+                            "Due date": norm_date_prop(prop_first(props, ["Due date","Due Date","Due"]))[0],
+                            "Story Points": norm_number(prop_first(props, ["Story Points","Points","SP"])),
                         }
 
                         if mapped["Updated"]:
@@ -381,10 +362,12 @@ class SyncRunner:
             "new_watermark": self.new_watermark,
         }, indent=2))
 
+# ---------- Entry Point ----------
+
 def main():
     token = os.getenv("NOTION_TOKEN")
     consolidated = os.getenv("CONSOLIDATED_DB_ID")
-    control_db = os.getenv("SYNC_CONTROL_PAGE_ID")  # using the inline DB id
+    control_db = os.getenv("SYNC_CONTROL_PAGE_ID")
     sources_csv = os.getenv("SOURCE_DB_IDS", "")
     if not token or not consolidated or not control_db or not sources_csv:
         print("Missing required env vars: NOTION_TOKEN, CONSOLIDATED_DB_ID, SYNC_CONTROL_PAGE_ID, SOURCE_DB_IDS", file=sys.stderr)
