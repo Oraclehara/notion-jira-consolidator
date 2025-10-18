@@ -1,0 +1,45 @@
+name: Notion Jira Consolidator (Public-Hardened)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "7 * * * *"   # hourly
+
+permissions:
+  contents: read           # least privilege
+
+concurrency:
+  group: jira-notion-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: prod-secrets
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: python -m pip install --upgrade pip requests
+
+      - name: Ensure script is present & executable
+        run: |
+          test -f scripts/sync_jira_notionsrc.py
+          chmod +x scripts/sync_jira_notionsrc.py
+
+      - name: Run incremental sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          CONSOLIDATED_DB_ID: ${{ secrets.CONSOLIDATED_DB_ID }}
+          SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
+          SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
+          MAX_PAGES_PER_RUN: ${{ vars.MAX_PAGES_PER_RUN || 50 }}
+          PAGE_SIZE: ${{ vars.PAGE_SIZE || 100 }}
+          BATCH_SIZE: ${{ vars.BATCH_SIZE || 10 }}
+          SLEEP_SECS: ${{ vars.SLEEP_SECS || 0.4 }}
+          FULL_SCAN_WEEKDAY: ${{ vars.FULL_SCAN_WEEKDAY || 6 }}
+        run: python scripts/sync_jira_notionsrc.py
