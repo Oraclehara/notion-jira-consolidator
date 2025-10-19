@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — status-safe + reporter/assignee/due date fix
+# Notion-based Jira Consolidator (No Jira API) — rollup-aware for Reporter/Assignee
 
 import os, sys, time, json, hashlib, datetime as dt, re
 from typing import Dict, Any, List, Optional, Tuple
@@ -68,60 +68,123 @@ MAPPED_FIELDS = [
 def norm_key(v: Any) -> str:
     return str(v or "").strip().upper()
 
+def _join_plain_text(blocks: List[Dict[str, Any]]) -> str:
+    return "".join((b.get("plain_text") or "") for b in (blocks or [])).strip()
+
 def norm_people_or_text(prop: Dict[str, Any]) -> str:
     if not prop: return ""
     t = prop.get("type")
     if t == "people":
         names = []
-        for p in prop.get("people", []):
+        ppl = prop.get("people", [])
+        for p in (ppl or []):
             nm = p.get("name") or (p.get("person") or {}).get("email") or ""
             if nm: names.append(nm)
         return ", ".join(names)
     if t == "rich_text":
-        return "".join(rt.get("plain_text","") for rt in prop.get("rich_text", [])).strip()
+        return _join_plain_text(prop.get("rich_text", []))
     if t == "title":
-        return "".join(rt.get("plain_text","") for rt in prop.get("title", [])).strip()
+        return _join_plain_text(prop.get("title", []))
     if t == "select":
         sel = prop.get("select")
         return (sel or {}).get("name") or ""
-    if t == "url":
-        return prop.get("url") or ""
-    return ""
-
-def norm_status(prop: Dict[str, Any]) -> str:
-    """Support both Notion 'status' and 'select' fields."""
-    if not prop:
-        return ""
-    t = prop.get("type")
     if t == "status":
         st = prop.get("status") or {}
         return (st.get("name") or "").strip()
-    if t == "select":
-        sel = prop.get("select") or {}
-        return (sel.get("name") or "").strip()
-    return norm_people_or_text(prop).strip()
+    if t == "url":
+        return prop.get("url") or ""
+    if t == "email":
+        return prop.get("email") or ""
+    if t == "number":
+        v = prop.get("number")
+        return "" if v is None else str(v)
+    if t == "date":
+        d = prop.get("date") or {}
+        return d.get("start") or ""
+    # relation can't be resolved without extra API calls; skip here
+    return ""
 
-def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
-    """First matching property: exact → case/trim-insensitive → fuzzy contains."""
-    if not props:
-        return None
-    # exact
-    for n in names:
-        if n in props and props[n]:
-            return props[n]
-    # case/trim-insensitive
-    norm_map = { (k or "").strip().lower(): k for k in props.keys() }
-    for n in names:
-        k = norm_map.get((n or "").strip().lower())
-        if k and props.get(k):
-            return props[k]
-    # fuzzy contains
-    wanted = [s.strip().lower() for s in names if s]
-    for k in props.keys():
-        nk = (k or "").strip().lower()
-        if any(w in nk for w in wanted) and props.get(k):
-            return props[k]
-    return None
+def _norm_rollup_item(item: Dict[str, Any]) -> str:
+    """A rollup array element can be a mini 'property item' (title/rich_text/people/number/date/url/email/select/status)."""
+    if not item: return ""
+    t = item.get("type")
+
+    if t in ("rich_text", "title"):
+        return _join_plain_text(item.get(t, []))
+
+    if t == "people":
+        # item['people'] may be a list or a single user
+        ppl = item.get("people")
+        names: List[str] = []
+        if isinstance(ppl, list):
+            for p in ppl:
+                nm = p.get("name") or (p.get("person") or {}).get("email") or ""
+                if nm: names.append(nm)
+        elif isinstance(ppl, dict):
+            nm = ppl.get("name") or (ppl.get("person") or {}).get("email") or ""
+            if nm: names.append(nm)
+        return ", ".join(names)
+
+    if t == "select":
+        sel = item.get("select") or {}
+        return sel.get("name") or ""
+
+    if t == "status":
+        st = item.get("status") or {}
+        return (st.get("name") or "").strip()
+
+    if t == "email":
+        return item.get("email") or ""
+
+    if t == "url":
+        return item.get("url") or ""
+
+    if t == "number":
+        v = item.get("number")
+        return "" if v is None else str(v)
+
+    if t == "date":
+        d = item.get("date") or {}
+        return d.get("start") or ""
+
+    # Fallback: try to treat it like a normal property
+    return norm_people_or_text(item)
+
+def norm_any_text(prop: Optional[Dict[str, Any]]) -> str:
+    """Superset extractor: handles people/text/title/select/status/url/email/number/date and rollups of them."""
+    if not prop: return ""
+    t = prop.get("type")
+
+    if t == "rollup":
+        r = prop.get("rollup") or {}
+        rt = r.get("type")
+        if rt == "array":
+            acc: List[str] = []
+            for it in r.get("array", []) or []:
+                s = _norm_rollup_item(it)
+                if s: acc.append(s)
+            # de-dup while preserving order
+            out: List[str] = []
+            seen = set()
+            for s in acc:
+                if s not in seen:
+                    seen.add(s); out.append(s)
+            return ", ".join(out)
+        elif rt == "date":
+            d = r.get("date") or {}
+            return d.get("start") or ""
+        elif rt == "number":
+            v = r.get("number")
+            return "" if v is None else str(v)
+        elif rt in ("rich_text", "title", "people", "select", "status", "url", "email"):
+            # Some rollup variants inline a single item
+            fake = {rt: r.get(rt), "type": rt}
+            return norm_people_or_text(fake)
+        else:
+            return ""
+
+    # Non-rollup types -> reuse the standard normalizer
+    return norm_people_or_text(prop)
 
 def norm_labels(prop: Dict[str, Any]) -> str:
     items: List[str] = []
@@ -176,50 +239,60 @@ def extract_updated(prop: Dict[str, Any], fallback_last_edited_time: Optional[st
 
 # --- Date parsing from text (Due date fallback) ---
 ISO_RE = re.compile(r"^(\d{4})[-/](\d{2})[-/](\d{2})(?:[ T](\d{2}):?(\d{2})(?::?(\d{2}))?)?(.*)$")
-DMY_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")  # assume DD/MM/YYYY (common outside US)
+DMY_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
 YMD_SLASH_RE = re.compile(r"^(\d{4})/(\d{1,2})/(\d{1,2})$")
 
 def _zero2(x: str) -> str:
     return x if len(x) == 2 else x.zfill(2)
 
 def extract_date_any(prop: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Return ISO-8601 'start' string if prop is a Date, else parse common text formats."""
     if not prop:
         return None
-    # Native date
     d, _ = norm_date_prop(prop)
     if d:
         return d
-
-    # Text-based
-    txt = norm_people_or_text(prop)
+    txt = norm_any_text(prop)
     if not txt:
         return None
     txt = txt.strip()
 
-    # 1) YYYY-MM-DD or YYYY/MM/DD (optionally with time)
     m = ISO_RE.match(txt)
     if m:
-        y, mo, d, hh, mm, ss, tail = m.groups()
+        y, mo, d, hh, mm, ss, _tail = m.groups()
         y, mo, d = y, _zero2(mo), _zero2(d)
         if hh and mm:
             ss = ss or "00"
             return f"{y}-{mo}-{d}T{_zero2(hh)}:{_zero2(mm)}:{_zero2(ss)}"
         return f"{y}-{mo}-{d}"
 
-    # 2) YYYY/MM/DD (no time, slashes)
     m = YMD_SLASH_RE.match(txt)
     if m:
         y, mo, d = m.groups()
         return f"{y}-{_zero2(mo)}-{_zero2(d)}"
 
-    # 3) DD/MM/YYYY (assume non-US)
     m = DMY_RE.match(txt)
     if m:
         d, mo, y = m.groups()
         return f"{y}-{_zero2(mo)}-{_zero2(d)}"
 
-    # If nothing matched, return None (avoid writing bad date)
+    return None
+
+def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
+    if not props:
+        return None
+    for n in names:
+        if n in props and props[n]:
+            return props[n]
+    norm_map = { (k or "").strip().lower(): k for k in props.keys() }
+    for n in names:
+        k = norm_map.get((n or "").strip().lower())
+        if k and props.get(k):
+            return props[k]
+    wanted = [s.strip().lower() for s in names if s]
+    for k in props.keys():
+        nk = (k or "").strip().lower()
+        if any(w in nk for w in wanted) and props.get(k):
+            return props[k]
     return None
 
 # ---------- Notion Property Builders ----------
@@ -296,17 +369,15 @@ class SyncRunner:
         return results[0] if results else None
 
     def _consolidated_status_is_status_type(self) -> bool:
-        # single fetch to detect type of Status
         res = self.notion.db_query(self.consolidated_db, {"page_size": 1})
         db_page = res.get("results", [{}])
         if not db_page:
-            return True  # default assume status
+            return True
         props = db_page[0].get("properties", {})
         st = props.get("Status", {})
         return st.get("type") == "status"
 
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
-        # detect consolidated Status type (status vs select)
         status_is_status = self._consolidated_status_is_status_type()
 
         src_hash = compute_source_hash(mapped)
@@ -331,7 +402,6 @@ class SyncRunner:
             "Source Database": rich(src_db_id),
         }
 
-        # Only set Status if we actually resolved a value; respect property type
         if mapped.get("Status"):
             props["Status"] = status_prop(mapped["Status"]) if status_is_status else sel(mapped["Status"])
 
@@ -402,50 +472,36 @@ class SyncRunner:
 
                         mapped = {
                             "Key": key,
-                            "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
-                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
-                            "Status": enum_safe("Status", norm_status(
+                            "Summary": norm_any_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
+                            "Issue Type": enum_safe("Issue Type", norm_any_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
+                            "Status": enum_safe("Status", norm_any_text(
                                 prop_first(props, [
-                                    "Status",
-                                    "Status (Jira)",
-                                    "Issue Status",
-                                    "State",
-                                    "Status name",
-                                    "Status Name",
-                                    "Jira Status",
-                                    "Current status",
-                                    "Workflow State",
+                                    "Status","Status (Jira)","Issue Status","State",
+                                    "Status name","Status Name","Jira Status","Current status","Workflow State"
                                 ])
                             )),
-                            "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
+                            "Priority": enum_safe("Priority", norm_any_text(prop_first(props, ["Priority","Issue Priority"]))),
 
-                            # Expanded aliases for Reporter & Assignee; supports People or Text
-                            "Reporter": norm_people_or_text(prop_first(
+                            # >>> Rollup-aware Reporter/Assignee (prioritize Related* first)
+                            "Reporter": norm_any_text(prop_first(
                                 props,
-                                ["Reporter","Reporter (Jira)","Reported By","Creator","Author","Reporter Name"]
+                                ["Related Jira Reporter","Reporter","Reporter (Jira)","Reported By","Creator","Author","Reporter Name"]
                             )),
-                            "Assignee": norm_people_or_text(prop_first(
+                            "Assignee": norm_any_text(prop_first(
                                 props,
-                                ["Assignee","Assignee (Jira)","Assigned To","Owner","Handler","Assignee Name"]
+                                ["Related Jira Assignee","Assignee","Assignee (Jira)","Assigned To","Owner","Handler","Assignee Name"]
                             )),
 
-                            "Sprint": norm_people_or_text(prop_first(props, ["Sprint","Iteration","Milestone"])),
-                            "Epic Link": norm_people_or_text(prop_first(props, ["Epic Link","Epic","Parent Epic"])),
-                            "Parent": norm_people_or_text(prop_first(props, ["Parent","Parent Issue"])),
+                            "Sprint": norm_any_text(prop_first(props, ["Sprint","Iteration","Milestone"])),
+                            "Epic Link": norm_any_text(prop_first(props, ["Epic Link","Epic","Parent Epic"])),
+                            "Parent": norm_any_text(prop_first(props, ["Parent","Parent Issue"])),
                             "Labels": norm_labels(prop_first(props, ["Labels","Label","Tags"])),
                             "Jira URL": norm_url(prop_first(props, ["Jira URL","URL","Link"])),
 
                             "Created": norm_date_prop(prop_first(props, ["Created","Created time","Created Time"]))[0],
                             "Updated": extract_updated(prop_first(props, ["Updated","Updated time","Last Updated"]), last_edited),
-
                             "Resolved": norm_date_prop(prop_first(props, ["Resolved","Resolution date"]))[0],
-
-                            # Use smart parser to accept Date or Text-based date
-                            "Due date": extract_date_any(prop_first(
-                                props,
-                                ["Due date","Due Date","Due","Target Date","Deadline","Target date"]
-                            )),
-
+                            "Due date": extract_date_any(prop_first(props, ["Due date","Due Date","Due","Target Date","Deadline","Target date"])),
                             "Story Points": norm_number(prop_first(props, ["Story Points","Points","SP"])),
                         }
 
