@@ -393,10 +393,12 @@ class SyncRunner:
 
                         # 1) Try alias list
                         st_prop = prop_first(props, [
-                            "Status","Status (Jira)","Issue Status","State",
+                            "Status (Jira)","Issue Status","State",
                             "Status name","Status Name","Jira Status",
-                            "Current status","Workflow State","Workflow status","Status category"
+                            "Current status","Workflow State","Workflow status","Status category",
+                            "Status"
                         ])
+
                         st_val = enum_safe("Status", norm_status(st_prop)) if st_prop else ""
 
                         # 2) Fallback scan if still blank
