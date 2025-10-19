@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — status-safe version
+# Notion-based Jira Consolidator (No Jira API) — status-type autodetect + hardened
 
 import os, sys, time, json, hashlib, datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
@@ -41,6 +41,9 @@ class Notion:
     def db_query(self, db_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._req("POST", f"/databases/{db_id}/query", json=payload)
 
+    def database_retrieve(self, db_id: str) -> Dict[str, Any]:
+        return self._req("GET", f"/databases/{db_id}")
+
     def page_retrieve(self, page_id: str) -> Dict[str, Any]:
         return self._req("GET", f"/pages/{page_id}")
 
@@ -54,7 +57,7 @@ class Notion:
 
 SAFE_ENUMS = {
     "Issue Type": {"default": "Other", "map": {}},
-    # leave blank if we can't detect it; don't overwrite with "Unknown"
+    # Leave blank if we can't detect it; don't overwrite with "Unknown"
     "Status": {"default": "", "map": {}},
     "Priority": {"default": "None", "map": {}},
 }
@@ -87,7 +90,7 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
     return ""
 
 def norm_status(prop: Dict[str, Any]) -> str:
-    """Support both Notion 'status' and 'select' fields."""
+    """Support both Notion 'status' and 'select' fields (and fall back to text)."""
     if not prop:
         return ""
     t = prop.get("type")
@@ -103,14 +106,17 @@ def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, An
     """First matching property: exact → case/trim-insensitive → fuzzy contains."""
     if not props:
         return None
+    # exact
     for n in names:
         if n in props and props[n]:
             return props[n]
+    # case/trim-insensitive
     norm_map = { (k or "").strip().lower(): k for k in props.keys() }
     for n in names:
         k = norm_map.get((n or "").strip().lower())
         if k and props.get(k):
             return props[k]
+    # fuzzy contains
     wanted = [s.strip().lower() for s in names if s]
     for k in props.keys():
         nk = (k or "").strip().lower()
@@ -215,7 +221,24 @@ class SyncRunner:
         self.sleep_secs = float(os.getenv("SLEEP_SECS", "0.4"))
         self.stats = {"fetched":0,"created":0,"updated":0,"skipped":0,"errors":0}
         self.new_watermark: Optional[str] = None
+        self.target_status_type: Optional[str] = None  # 'status' | 'select' | 'rich_text' | None
 
+    # Discover the actual property type for "Status" on the target
+    def _load_target_schema(self):
+        try:
+            db = self.notion.database_retrieve(self.consolidated_db)
+            props = db.get("properties", {})
+            st = props.get("Status")
+            if isinstance(st, dict):
+                self.target_status_type = st.get("type")
+            else:
+                self.target_status_type = None
+            print(f"INFO Consolidated.Status type detected: {self.target_status_type}")
+        except Exception as e:
+            print("WARN Unable to retrieve target DB schema; will default to status->select->rich_text:", e)
+            self.target_status_type = None
+
+    # We store the watermark in a tiny DB (first row)
     def _get_control_row_id_and_value(self) -> Tuple[Optional[str], Optional[str]]:
         res = self.notion.db_query(self.sync_control_db, {"page_size": 1})
         rows = res.get("results", [])
@@ -242,6 +265,21 @@ class SyncRunner:
         results = res.get("results", [])
         return results[0] if results else None
 
+    def _status_payload_for_target(self, value: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Build the correct Status payload matching the target field type."""
+        if not value:
+            return None
+        t = self.target_status_type
+        # Prefer detected type; if undetected, try status -> select -> rich_text
+        if t == "status":
+            return status_prop(value)
+        if t == "select":
+            return sel(value)
+        if t == "rich_text":
+            return rich(value)
+        # Fallback ordering when type unknown
+        return status_prop(value)  # runner will error if type mismatches; caller catches
+
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
         src_hash = compute_source_hash(mapped)
         props = {
@@ -265,9 +303,10 @@ class SyncRunner:
             "Source Database": rich(src_db_id),
         }
 
-        # Only set Status if we actually resolved a value, and use the Status-type payload
-        if mapped.get("Status"):
-            props["Status"] = status_prop(mapped["Status"])
+        # Only set Status if we actually resolved a value, and use target's type
+        st_payload = self._status_payload_for_target(mapped.get("Status"))
+        if st_payload:
+            props["Status"] = st_payload
 
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
@@ -292,6 +331,9 @@ class SyncRunner:
         return dt.datetime.utcnow().weekday() == int(os.getenv("FULL_SCAN_WEEKDAY", "6"))
 
     def run(self):
+        # Read target schema once so we know how to write Status
+        self._load_target_schema()
+
         control_row_id, watermark = self._get_control_row_id_and_value()
         if self._should_full_scan():
             watermark = None
@@ -330,44 +372,65 @@ class SyncRunner:
                         props = r.get("properties", {})
                         last_edited = r.get("last_edited_time")
 
-                        # --- Optional DEBUG (prints once per source) ---
-                        # if self.stats["fetched"] == 1:
-                        #     print("DEBUG property keys for source", src_db, ":", list(props.keys()))
-
                         key = norm_key(norm_people_or_text(props.get("Key")))
                         if not key:
                             continue
 
                         mapped = {
                             "Key": key,
-                            "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
-                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
+                            "Summary": norm_people_or_text(
+                                prop_first(props, ["Summary","Title","Issue summary","Name"])
+                            ),
+                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(
+                                prop_first(props, ["Issue Type","Type","Issue type"])
+                            )),
                             "Status": enum_safe("Status", norm_status(
                                 prop_first(props, [
-                                    "Status",
-                                    "Status (Jira)",
-                                    "Issue Status",
-                                    "State",
-                                    "Status name",
-                                    "Status Name",
-                                    "Jira Status",
-                                    "Current status",
-                                    "Workflow State",
+                                    "Status","Status (Jira)","Issue Status","State",
+                                    "Status name","Status Name","Jira Status",
+                                    "Current status","Workflow State"
                                 ])
                             )),
-                            "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
-                            "Reporter": norm_people_or_text(prop_first(props, ["Reporter","Reported By","Creator"])),
-                            "Assignee": norm_people_or_text(prop_first(props, ["Assignee","Owner","Assigned To"])),
-                            "Sprint": norm_people_or_text(prop_first(props, ["Sprint","Iteration","Milestone"])),
-                            "Epic Link": norm_people_or_text(prop_first(props, ["Epic Link","Epic","Parent Epic"])),
-                            "Parent": norm_people_or_text(prop_first(props, ["Parent","Parent Issue"])),
-                            "Labels": norm_labels(prop_first(props, ["Labels","Label","Tags"])),
-                            "Jira URL": norm_url(prop_first(props, ["Jira URL","URL","Link"])),
-                            "Created": norm_date_prop(prop_first(props, ["Created","Created time","Created Time"]))[0],
-                            "Updated": extract_updated(prop_first(props, ["Updated","Updated time","Last Updated"]), last_edited),
-                            "Resolved": norm_date_prop(prop_first(props, ["Resolved","Resolution date"]))[0],
-                            "Due date": norm_date_prop(prop_first(props, ["Due date","Due Date","Due"]))[0],
-                            "Story Points": norm_number(prop_first(props, ["Story Points","Points","SP"])),
+                            "Priority": enum_safe("Priority", norm_people_or_text(
+                                prop_first(props, ["Priority","Issue Priority"])
+                            )),
+                            "Reporter": norm_people_or_text(
+                                prop_first(props, ["Reporter","Reported By","Creator"])
+                            ),
+                            "Assignee": norm_people_or_text(
+                                prop_first(props, ["Assignee","Owner","Assigned To"])
+                            ),
+                            "Sprint": norm_people_or_text(
+                                prop_first(props, ["Sprint","Iteration","Milestone"])
+                            ),
+                            "Epic Link": norm_people_or_text(
+                                prop_first(props, ["Epic Link","Epic","Parent Epic"])
+                            ),
+                            "Parent": norm_people_or_text(
+                                prop_first(props, ["Parent","Parent Issue"])
+                            ),
+                            "Labels": norm_labels(
+                                prop_first(props, ["Labels","Label","Tags"])
+                            ),
+                            "Jira URL": norm_url(
+                                prop_first(props, ["Jira URL","URL","Link"])
+                            ),
+                            "Created": norm_date_prop(
+                                prop_first(props, ["Created","Created time","Created Time"])
+                            )[0],
+                            "Updated": extract_updated(
+                                prop_first(props, ["Updated","Updated time","Last Updated"]),
+                                last_edited
+                            ),
+                            "Resolved": norm_date_prop(
+                                prop_first(props, ["Resolved","Resolution date"])
+                            )[0],
+                            "Due date": norm_date_prop(
+                                prop_first(props, ["Due date","Due Date","Due"])
+                            )[0],
+                            "Story Points": norm_number(
+                                prop_first(props, ["Story Points","Points","SP"])
+                            ),
                         }
 
                         if mapped["Updated"]:
