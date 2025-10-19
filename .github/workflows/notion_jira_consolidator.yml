@@ -37,10 +37,12 @@ jobs:
           CONSOLIDATED_DB_ID: ${{ secrets.CONSOLIDATED_DB_ID }}
           SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
           SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
-          MAX_PAGES_PER_RUN: ${{ vars.MAX_PAGES_PER_RUN || 50 }}
+         # MAX_PAGES_PER_RUN: ${{ vars.MAX_PAGES_PER_RUN || 50 }}
+          MAX_PAGES_PER_RUN: 20
           PAGE_SIZE: ${{ vars.PAGE_SIZE || 100 }}
           BATCH_SIZE: ${{ vars.BATCH_SIZE || 10 }}
           SLEEP_SECS: ${{ vars.SLEEP_SECS || 0.4 }}
           FULL_SCAN_WEEKDAY: ${{ vars.FULL_SCAN_WEEKDAY || 6 }}
-          FORCE_FULL_SCAN: ${{ vars.FORCE_FULL_SCAN || '' }}
+          FORCE_FULL_SCAN: '1'
+         # FORCE_FULL_SCAN: ${{ vars.FORCE_FULL_SCAN || '' }}
         run: python scripts/sync_jira_notionsrc.py
