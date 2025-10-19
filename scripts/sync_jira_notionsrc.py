@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — status-type autodetect + hardened
+# Notion-based Jira Consolidator (No Jira API) — robust Status extraction + type autodetect
 
 import os, sys, time, json, hashlib, datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
@@ -124,6 +124,20 @@ def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, An
             return props[k]
     return None
 
+def extract_any_status(props: Dict[str, Any]) -> str:
+    """Last-resort scan: use any property whose name contains 'status' and yields a non-empty value."""
+    if not props:
+        return ""
+    for name, prop in props.items():
+        if "status" in (name or "").lower():
+            val = norm_status(prop)
+            if not val:
+                # try text-ish extraction
+                val = norm_people_or_text(prop)
+            if val:
+                return val.strip()
+    return ""
+
 def norm_labels(prop: Dict[str, Any]) -> str:
     items: List[str] = []
     if not prop: return ""
@@ -222,6 +236,7 @@ class SyncRunner:
         self.stats = {"fetched":0,"created":0,"updated":0,"skipped":0,"errors":0}
         self.new_watermark: Optional[str] = None
         self.target_status_type: Optional[str] = None  # 'status' | 'select' | 'rich_text' | None
+        self.status_empty_count = 0
 
     # Discover the actual property type for "Status" on the target
     def _load_target_schema(self):
@@ -270,15 +285,14 @@ class SyncRunner:
         if not value:
             return None
         t = self.target_status_type
-        # Prefer detected type; if undetected, try status -> select -> rich_text
         if t == "status":
             return status_prop(value)
         if t == "select":
             return sel(value)
         if t == "rich_text":
             return rich(value)
-        # Fallback ordering when type unknown
-        return status_prop(value)  # runner will error if type mismatches; caller catches
+        # Unknown type: try 'status'
+        return status_prop(value)
 
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
         src_hash = compute_source_hash(mapped)
@@ -303,10 +317,11 @@ class SyncRunner:
             "Source Database": rich(src_db_id),
         }
 
-        # Only set Status if we actually resolved a value, and use target's type
         st_payload = self._status_payload_for_target(mapped.get("Status"))
         if st_payload:
             props["Status"] = st_payload
+        else:
+            self.status_empty_count += 1  # track empties for debug
 
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
@@ -376,6 +391,18 @@ class SyncRunner:
                         if not key:
                             continue
 
+                        # 1) Try alias list
+                        st_prop = prop_first(props, [
+                            "Status","Status (Jira)","Issue Status","State",
+                            "Status name","Status Name","Jira Status",
+                            "Current status","Workflow State","Workflow status","Status category"
+                        ])
+                        st_val = enum_safe("Status", norm_status(st_prop)) if st_prop else ""
+
+                        # 2) Fallback scan if still blank
+                        if not st_val:
+                            st_val = enum_safe("Status", extract_any_status(props))
+
                         mapped = {
                             "Key": key,
                             "Summary": norm_people_or_text(
@@ -384,13 +411,7 @@ class SyncRunner:
                             "Issue Type": enum_safe("Issue Type", norm_people_or_text(
                                 prop_first(props, ["Issue Type","Type","Issue type"])
                             )),
-                            "Status": enum_safe("Status", norm_status(
-                                prop_first(props, [
-                                    "Status","Status (Jira)","Issue Status","State",
-                                    "Status name","Status Name","Jira Status",
-                                    "Current status","Workflow State"
-                                ])
-                            )),
+                            "Status": st_val,
                             "Priority": enum_safe("Priority", norm_people_or_text(
                                 prop_first(props, ["Priority","Issue Priority"])
                             )),
@@ -459,6 +480,7 @@ class SyncRunner:
             "skipped": self.stats["skipped"],
             "errors": self.stats["errors"],
             "new_watermark": self.new_watermark,
+            "status_empty_count": self.status_empty_count,
         }, indent=2))
 
 # ---------- Entry Point ----------
