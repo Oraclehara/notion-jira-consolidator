@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — schema-aware status mapping
+# Notion-based Jira Consolidator (No Jira API) — status-safe + reporter/assignee/due date fix
 
 import os, sys, time, json, hashlib, datetime as dt, re
-from typing import Dict, Any, List, Optional, Tuple, Set
+from typing import Dict, Any, List, Optional, Tuple
 import requests
 
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -41,9 +41,6 @@ class Notion:
     def db_query(self, db_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._req("POST", f"/databases/{db_id}/query", json=payload)
 
-    def db_retrieve(self, db_id: str) -> Dict[str, Any]:
-        return self._req("GET", f"/databases/{db_id}")
-
     def page_retrieve(self, page_id: str) -> Dict[str, Any]:
         return self._req("GET", f"/pages/{page_id}")
 
@@ -57,7 +54,7 @@ class Notion:
 
 SAFE_ENUMS = {
     "Issue Type": {"default": "Other", "map": {}},
-    # For Status, we *do not* force a default; we only set when we can map to an allowed option.
+    # leave blank if we can't detect it; don't overwrite with "Unknown"
     "Status": {"default": "", "map": {}},
     "Priority": {"default": "None", "map": {}},
 }
@@ -87,13 +84,14 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
     if t == "select":
         sel = prop.get("select")
         return (sel or {}).get("name") or ""
-    if t == "status":
-        st = prop.get("status") or {}
-        return (st.get("name") or "").strip()
+    if t == "url":
+        return prop.get("url") or ""
     return ""
 
 def norm_status(prop: Dict[str, Any]) -> str:
-    if not prop: return ""
+    """Support both Notion 'status' and 'select' fields."""
+    if not prop:
+        return ""
     t = prop.get("type")
     if t == "status":
         st = prop.get("status") or {}
@@ -104,19 +102,20 @@ def norm_status(prop: Dict[str, Any]) -> str:
     return norm_people_or_text(prop).strip()
 
 def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
+    """First matching property: exact → case/trim-insensitive → fuzzy contains."""
     if not props:
         return None
-    # 1) Exact
+    # exact
     for n in names:
         if n in props and props[n]:
             return props[n]
-    # 2) Case/trim-insensitive
+    # case/trim-insensitive
     norm_map = { (k or "").strip().lower(): k for k in props.keys() }
     for n in names:
         k = norm_map.get((n or "").strip().lower())
         if k and props.get(k):
             return props[k]
-    # 3) Fuzzy "contains"
+    # fuzzy contains
     wanted = [s.strip().lower() for s in names if s]
     for k in props.keys():
         nk = (k or "").strip().lower()
@@ -175,6 +174,54 @@ def extract_updated(prop: Dict[str, Any], fallback_last_edited_time: Optional[st
     val, _ = norm_date_prop(prop)
     return val or fallback_last_edited_time
 
+# --- Date parsing from text (Due date fallback) ---
+ISO_RE = re.compile(r"^(\d{4})[-/](\d{2})[-/](\d{2})(?:[ T](\d{2}):?(\d{2})(?::?(\d{2}))?)?(.*)$")
+DMY_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")  # assume DD/MM/YYYY (common outside US)
+YMD_SLASH_RE = re.compile(r"^(\d{4})/(\d{1,2})/(\d{1,2})$")
+
+def _zero2(x: str) -> str:
+    return x if len(x) == 2 else x.zfill(2)
+
+def extract_date_any(prop: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return ISO-8601 'start' string if prop is a Date, else parse common text formats."""
+    if not prop:
+        return None
+    # Native date
+    d, _ = norm_date_prop(prop)
+    if d:
+        return d
+
+    # Text-based
+    txt = norm_people_or_text(prop)
+    if not txt:
+        return None
+    txt = txt.strip()
+
+    # 1) YYYY-MM-DD or YYYY/MM/DD (optionally with time)
+    m = ISO_RE.match(txt)
+    if m:
+        y, mo, d, hh, mm, ss, tail = m.groups()
+        y, mo, d = y, _zero2(mo), _zero2(d)
+        if hh and mm:
+            ss = ss or "00"
+            return f"{y}-{mo}-{d}T{_zero2(hh)}:{_zero2(mm)}:{_zero2(ss)}"
+        return f"{y}-{mo}-{d}"
+
+    # 2) YYYY/MM/DD (no time, slashes)
+    m = YMD_SLASH_RE.match(txt)
+    if m:
+        y, mo, d = m.groups()
+        return f"{y}-{_zero2(mo)}-{_zero2(d)}"
+
+    # 3) DD/MM/YYYY (assume non-US)
+    m = DMY_RE.match(txt)
+    if m:
+        d, mo, y = m.groups()
+        return f"{y}-{_zero2(mo)}-{_zero2(d)}"
+
+    # If nothing matched, return None (avoid writing bad date)
+    return None
+
 # ---------- Notion Property Builders ----------
 
 def rich(v: str) -> Dict[str, Any]:
@@ -207,74 +254,6 @@ def ms(csv_text: Optional[str]) -> Dict[str, Any]:
                 vals.append({"name": name})
     return {"multi_select": vals}
 
-# ---------- Status mapping helpers ----------
-
-def _sluggify(s: str) -> str:
-    # lower, remove non-alnum, collapse spaces
-    s2 = re.sub(r"[^a-z0-9]+", " ", (s or "").lower())
-    return " ".join(s2.split())
-
-def build_allowed_status_set(notion: Notion, consolidated_db: str) -> Set[str]:
-    schema = notion.db_retrieve(consolidated_db)
-    props = schema.get("properties", {})
-    st = props.get("Status", {})
-    if st.get("type") != "status":
-        print("WARN Consolidated.Status is not a status type; will treat as select-like.")
-        return set()
-    groups = st.get("status", {}).get("groups", []) or []
-    opts: Set[str] = set()
-    for g in groups:
-        for o in g.get("options", []) or []:
-            name = (o.get("name") or "").strip()
-            if name:
-                opts.add(name)
-    print(f"INFO Consolidated.Status type detected: status; options={sorted(list(opts))}")
-    return opts
-
-def coerce_status_name(incoming: str, allowed: Set[str], alias_map: Dict[str, str]) -> Optional[str]:
-    if not incoming:
-        return None
-    inc_norm = _sluggify(incoming)
-
-    # 1) exact (case-insensitive)
-    for a in allowed:
-        if a.lower() == incoming.lower():
-            return a
-
-    # 2) alias table (keys and values compared case-insensitive)
-    aliased = alias_map.get(inc_norm)
-    if aliased:
-        for a in allowed:
-            if a.lower() == aliased.lower():
-                return a
-
-    # 3) soft match by slug contains
-    for a in allowed:
-        if inc_norm == _sluggify(a):
-            return a
-    for a in allowed:
-        if inc_norm in _sluggify(a) or _sluggify(a) in inc_norm:
-            return a
-
-    return None
-
-def load_status_aliases_from_env() -> Dict[str, str]:
-    """
-    Optional: define a repo variable STATUS_ALIAS_JSON with a JSON object like:
-    {"to do":"Todo","in progress":"In Progress","ready for testing":"Ready for Testing"}
-    Keys and values are matched case-insensitively; keys are slug-normalized.
-    """
-    raw = os.getenv("STATUS_ALIAS_JSON", "")
-    try:
-        data = json.loads(raw) if raw else {}
-    except Exception:
-        data = {}
-    alias: Dict[str, str] = {}
-    for k, v in data.items():
-        if isinstance(k, str) and isinstance(v, str):
-            alias[_sluggify(k)] = v.strip()
-    return alias
-
 # ---------- Sync Logic ----------
 
 class SyncRunner:
@@ -290,39 +269,6 @@ class SyncRunner:
         self.stats = {"fetched":0,"created":0,"updated":0,"skipped":0,"errors":0}
         self.new_watermark: Optional[str] = None
 
-        # status helpers
-        self.allowed_status: Set[str] = build_allowed_status_set(self.notion, self.consolidated_db)
-        # sane built-ins; can be overridden/extended via STATUS_ALIAS_JSON
-        builtin_aliases = {
-            "todo":"To Do",
-            "to do":"To Do",
-            "to-do":"To Do",
-            "backlog":"Backlog",
-            "triage":"Triage",
-            "in progress":"In Progress",
-            "doing":"In Progress",
-            "inprogress":"In Progress",
-            "dev in progress":"In Progress",
-            "ready for testing":"Ready for Testing",
-            "ready for qa":"Ready for Testing",
-            "qa":"Ready for Testing",
-            "testing":"Ready for Testing",
-            "blocked":"Blocked",
-            "on hold":"On Hold",
-            "done":"Done",
-            "resolved":"Done",
-            "closed":"Done",
-            "ready":"Ready",
-            "selected for development":"Selected for Development",
-            "selected":"Selected for Development",
-        }
-        self.status_aliases = builtin_aliases
-        self.status_aliases.update(load_status_aliases_from_env())
-
-        self.status_mapped = 0
-        self.status_skipped = 0
-
-    # We store the watermark in a tiny DB (first row)
     def _get_control_row_id_and_value(self) -> Tuple[Optional[str], Optional[str]]:
         res = self.notion.db_query(self.sync_control_db, {"page_size": 1})
         rows = res.get("results", [])
@@ -349,18 +295,21 @@ class SyncRunner:
         results = res.get("results", [])
         return results[0] if results else None
 
+    def _consolidated_status_is_status_type(self) -> bool:
+        # single fetch to detect type of Status
+        res = self.notion.db_query(self.consolidated_db, {"page_size": 1})
+        db_page = res.get("results", [{}])
+        if not db_page:
+            return True  # default assume status
+        props = db_page[0].get("properties", {})
+        st = props.get("Status", {})
+        return st.get("type") == "status"
+
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
+        # detect consolidated Status type (status vs select)
+        status_is_status = self._consolidated_status_is_status_type()
+
         src_hash = compute_source_hash(mapped)
-
-        # Coerce status to an allowed option; if unmapped, do not set (avoids 400 errors).
-        coerced_status: Optional[str] = None
-        if mapped.get("Status"):
-            coerced_status = coerce_status_name(mapped["Status"], self.allowed_status, self.status_aliases)
-            if coerced_status: 
-                self.status_mapped += 1
-            else:
-                self.status_skipped += 1
-
         props = {
             "Key": title(mapped["Key"]),
             "Summary": rich(mapped.get("Summary","")),
@@ -381,8 +330,10 @@ class SyncRunner:
             "Source Hash": rich(src_hash),
             "Source Database": rich(src_db_id),
         }
-        if coerced_status:
-            props["Status"] = status_prop(coerced_status)
+
+        # Only set Status if we actually resolved a value; respect property type
+        if mapped.get("Status"):
+            props["Status"] = status_prop(mapped["Status"]) if status_is_status else sel(mapped["Status"])
 
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
@@ -426,7 +377,11 @@ class SyncRunner:
                 }
 
                 if watermark:
-                    payload["filter"] = {"property": "Updated","date": {"on_or_after": watermark}}
+                    payload["filter"] = {
+                        "property": "Updated",
+                        "date": {"on_or_after": watermark}
+                    }
+
                 if next_cursor:
                     payload["start_cursor"] = next_cursor
 
@@ -449,27 +404,48 @@ class SyncRunner:
                             "Key": key,
                             "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
                             "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
-                            # Prefer board-visible "Status" over Jira-internal variants last
                             "Status": enum_safe("Status", norm_status(
                                 prop_first(props, [
-                                    "Status (Jira)","Issue Status","State",
-                                    "Status name","Status Name","Jira Status",
-                                    "Current status","Workflow State","Workflow status","Status category",
-                                    "Status"
+                                    "Status",
+                                    "Status (Jira)",
+                                    "Issue Status",
+                                    "State",
+                                    "Status name",
+                                    "Status Name",
+                                    "Jira Status",
+                                    "Current status",
+                                    "Workflow State",
                                 ])
                             )),
                             "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
-                            "Reporter": norm_people_or_text(prop_first(props, ["Reporter","Reported By","Creator"])),
-                            "Assignee": norm_people_or_text(prop_first(props, ["Assignee","Owner","Assigned To"])),
+
+                            # Expanded aliases for Reporter & Assignee; supports People or Text
+                            "Reporter": norm_people_or_text(prop_first(
+                                props,
+                                ["Reporter","Reporter (Jira)","Reported By","Creator","Author","Reporter Name"]
+                            )),
+                            "Assignee": norm_people_or_text(prop_first(
+                                props,
+                                ["Assignee","Assignee (Jira)","Assigned To","Owner","Handler","Assignee Name"]
+                            )),
+
                             "Sprint": norm_people_or_text(prop_first(props, ["Sprint","Iteration","Milestone"])),
                             "Epic Link": norm_people_or_text(prop_first(props, ["Epic Link","Epic","Parent Epic"])),
                             "Parent": norm_people_or_text(prop_first(props, ["Parent","Parent Issue"])),
                             "Labels": norm_labels(prop_first(props, ["Labels","Label","Tags"])),
                             "Jira URL": norm_url(prop_first(props, ["Jira URL","URL","Link"])),
+
                             "Created": norm_date_prop(prop_first(props, ["Created","Created time","Created Time"]))[0],
                             "Updated": extract_updated(prop_first(props, ["Updated","Updated time","Last Updated"]), last_edited),
+
                             "Resolved": norm_date_prop(prop_first(props, ["Resolved","Resolution date"]))[0],
-                            "Due date": norm_date_prop(prop_first(props, ["Due date","Due Date","Due"]))[0],
+
+                            # Use smart parser to accept Date or Text-based date
+                            "Due date": extract_date_any(prop_first(
+                                props,
+                                ["Due date","Due Date","Due","Target Date","Deadline","Target date"]
+                            )),
+
                             "Story Points": norm_number(prop_first(props, ["Story Points","Points","SP"])),
                         }
 
@@ -499,8 +475,6 @@ class SyncRunner:
             "skipped": self.stats["skipped"],
             "errors": self.stats["errors"],
             "new_watermark": self.new_watermark,
-            "status_mapped": self.status_mapped,
-            "status_skipped": self.status_skipped
         }, indent=2))
 
 # ---------- Entry Point ----------
