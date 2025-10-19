@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — robust Status extraction + type autodetect
+# Notion-based Jira Consolidator (No Jira API) — schema-aware status mapping
 
-import os, sys, time, json, hashlib, datetime as dt
-from typing import Dict, Any, List, Optional, Tuple
+import os, sys, time, json, hashlib, datetime as dt, re
+from typing import Dict, Any, List, Optional, Tuple, Set
 import requests
 
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -41,7 +41,7 @@ class Notion:
     def db_query(self, db_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._req("POST", f"/databases/{db_id}/query", json=payload)
 
-    def database_retrieve(self, db_id: str) -> Dict[str, Any]:
+    def db_retrieve(self, db_id: str) -> Dict[str, Any]:
         return self._req("GET", f"/databases/{db_id}")
 
     def page_retrieve(self, page_id: str) -> Dict[str, Any]:
@@ -57,7 +57,7 @@ class Notion:
 
 SAFE_ENUMS = {
     "Issue Type": {"default": "Other", "map": {}},
-    # Leave blank if we can't detect it; don't overwrite with "Unknown"
+    # For Status, we *do not* force a default; we only set when we can map to an allowed option.
     "Status": {"default": "", "map": {}},
     "Priority": {"default": "None", "map": {}},
 }
@@ -87,12 +87,13 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
     if t == "select":
         sel = prop.get("select")
         return (sel or {}).get("name") or ""
+    if t == "status":
+        st = prop.get("status") or {}
+        return (st.get("name") or "").strip()
     return ""
 
 def norm_status(prop: Dict[str, Any]) -> str:
-    """Support both Notion 'status' and 'select' fields (and fall back to text)."""
-    if not prop:
-        return ""
+    if not prop: return ""
     t = prop.get("type")
     if t == "status":
         st = prop.get("status") or {}
@@ -103,40 +104,25 @@ def norm_status(prop: Dict[str, Any]) -> str:
     return norm_people_or_text(prop).strip()
 
 def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
-    """First matching property: exact → case/trim-insensitive → fuzzy contains."""
     if not props:
         return None
-    # exact
+    # 1) Exact
     for n in names:
         if n in props and props[n]:
             return props[n]
-    # case/trim-insensitive
+    # 2) Case/trim-insensitive
     norm_map = { (k or "").strip().lower(): k for k in props.keys() }
     for n in names:
         k = norm_map.get((n or "").strip().lower())
         if k and props.get(k):
             return props[k]
-    # fuzzy contains
+    # 3) Fuzzy "contains"
     wanted = [s.strip().lower() for s in names if s]
     for k in props.keys():
         nk = (k or "").strip().lower()
         if any(w in nk for w in wanted) and props.get(k):
             return props[k]
     return None
-
-def extract_any_status(props: Dict[str, Any]) -> str:
-    """Last-resort scan: use any property whose name contains 'status' and yields a non-empty value."""
-    if not props:
-        return ""
-    for name, prop in props.items():
-        if "status" in (name or "").lower():
-            val = norm_status(prop)
-            if not val:
-                # try text-ish extraction
-                val = norm_people_or_text(prop)
-            if val:
-                return val.strip()
-    return ""
 
 def norm_labels(prop: Dict[str, Any]) -> str:
     items: List[str] = []
@@ -221,6 +207,74 @@ def ms(csv_text: Optional[str]) -> Dict[str, Any]:
                 vals.append({"name": name})
     return {"multi_select": vals}
 
+# ---------- Status mapping helpers ----------
+
+def _sluggify(s: str) -> str:
+    # lower, remove non-alnum, collapse spaces
+    s2 = re.sub(r"[^a-z0-9]+", " ", (s or "").lower())
+    return " ".join(s2.split())
+
+def build_allowed_status_set(notion: Notion, consolidated_db: str) -> Set[str]:
+    schema = notion.db_retrieve(consolidated_db)
+    props = schema.get("properties", {})
+    st = props.get("Status", {})
+    if st.get("type") != "status":
+        print("WARN Consolidated.Status is not a status type; will treat as select-like.")
+        return set()
+    groups = st.get("status", {}).get("groups", []) or []
+    opts: Set[str] = set()
+    for g in groups:
+        for o in g.get("options", []) or []:
+            name = (o.get("name") or "").strip()
+            if name:
+                opts.add(name)
+    print(f"INFO Consolidated.Status type detected: status; options={sorted(list(opts))}")
+    return opts
+
+def coerce_status_name(incoming: str, allowed: Set[str], alias_map: Dict[str, str]) -> Optional[str]:
+    if not incoming:
+        return None
+    inc_norm = _sluggify(incoming)
+
+    # 1) exact (case-insensitive)
+    for a in allowed:
+        if a.lower() == incoming.lower():
+            return a
+
+    # 2) alias table (keys and values compared case-insensitive)
+    aliased = alias_map.get(inc_norm)
+    if aliased:
+        for a in allowed:
+            if a.lower() == aliased.lower():
+                return a
+
+    # 3) soft match by slug contains
+    for a in allowed:
+        if inc_norm == _sluggify(a):
+            return a
+    for a in allowed:
+        if inc_norm in _sluggify(a) or _sluggify(a) in inc_norm:
+            return a
+
+    return None
+
+def load_status_aliases_from_env() -> Dict[str, str]:
+    """
+    Optional: define a repo variable STATUS_ALIAS_JSON with a JSON object like:
+    {"to do":"Todo","in progress":"In Progress","ready for testing":"Ready for Testing"}
+    Keys and values are matched case-insensitively; keys are slug-normalized.
+    """
+    raw = os.getenv("STATUS_ALIAS_JSON", "")
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+    alias: Dict[str, str] = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, str):
+            alias[_sluggify(k)] = v.strip()
+    return alias
+
 # ---------- Sync Logic ----------
 
 class SyncRunner:
@@ -235,23 +289,38 @@ class SyncRunner:
         self.sleep_secs = float(os.getenv("SLEEP_SECS", "0.4"))
         self.stats = {"fetched":0,"created":0,"updated":0,"skipped":0,"errors":0}
         self.new_watermark: Optional[str] = None
-        self.target_status_type: Optional[str] = None  # 'status' | 'select' | 'rich_text' | None
-        self.status_empty_count = 0
 
-    # Discover the actual property type for "Status" on the target
-    def _load_target_schema(self):
-        try:
-            db = self.notion.database_retrieve(self.consolidated_db)
-            props = db.get("properties", {})
-            st = props.get("Status")
-            if isinstance(st, dict):
-                self.target_status_type = st.get("type")
-            else:
-                self.target_status_type = None
-            print(f"INFO Consolidated.Status type detected: {self.target_status_type}")
-        except Exception as e:
-            print("WARN Unable to retrieve target DB schema; will default to status->select->rich_text:", e)
-            self.target_status_type = None
+        # status helpers
+        self.allowed_status: Set[str] = build_allowed_status_set(self.notion, self.consolidated_db)
+        # sane built-ins; can be overridden/extended via STATUS_ALIAS_JSON
+        builtin_aliases = {
+            "todo":"To Do",
+            "to do":"To Do",
+            "to-do":"To Do",
+            "backlog":"Backlog",
+            "triage":"Triage",
+            "in progress":"In Progress",
+            "doing":"In Progress",
+            "inprogress":"In Progress",
+            "dev in progress":"In Progress",
+            "ready for testing":"Ready for Testing",
+            "ready for qa":"Ready for Testing",
+            "qa":"Ready for Testing",
+            "testing":"Ready for Testing",
+            "blocked":"Blocked",
+            "on hold":"On Hold",
+            "done":"Done",
+            "resolved":"Done",
+            "closed":"Done",
+            "ready":"Ready",
+            "selected for development":"Selected for Development",
+            "selected":"Selected for Development",
+        }
+        self.status_aliases = builtin_aliases
+        self.status_aliases.update(load_status_aliases_from_env())
+
+        self.status_mapped = 0
+        self.status_skipped = 0
 
     # We store the watermark in a tiny DB (first row)
     def _get_control_row_id_and_value(self) -> Tuple[Optional[str], Optional[str]]:
@@ -280,22 +349,18 @@ class SyncRunner:
         results = res.get("results", [])
         return results[0] if results else None
 
-    def _status_payload_for_target(self, value: Optional[str]) -> Optional[Dict[str, Any]]:
-        """Build the correct Status payload matching the target field type."""
-        if not value:
-            return None
-        t = self.target_status_type
-        if t == "status":
-            return status_prop(value)
-        if t == "select":
-            return sel(value)
-        if t == "rich_text":
-            return rich(value)
-        # Unknown type: try 'status'
-        return status_prop(value)
-
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
         src_hash = compute_source_hash(mapped)
+
+        # Coerce status to an allowed option; if unmapped, do not set (avoids 400 errors).
+        coerced_status: Optional[str] = None
+        if mapped.get("Status"):
+            coerced_status = coerce_status_name(mapped["Status"], self.allowed_status, self.status_aliases)
+            if coerced_status: 
+                self.status_mapped += 1
+            else:
+                self.status_skipped += 1
+
         props = {
             "Key": title(mapped["Key"]),
             "Summary": rich(mapped.get("Summary","")),
@@ -316,12 +381,8 @@ class SyncRunner:
             "Source Hash": rich(src_hash),
             "Source Database": rich(src_db_id),
         }
-
-        st_payload = self._status_payload_for_target(mapped.get("Status"))
-        if st_payload:
-            props["Status"] = st_payload
-        else:
-            self.status_empty_count += 1  # track empties for debug
+        if coerced_status:
+            props["Status"] = status_prop(coerced_status)
 
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
@@ -346,9 +407,6 @@ class SyncRunner:
         return dt.datetime.utcnow().weekday() == int(os.getenv("FULL_SCAN_WEEKDAY", "6"))
 
     def run(self):
-        # Read target schema once so we know how to write Status
-        self._load_target_schema()
-
         control_row_id, watermark = self._get_control_row_id_and_value()
         if self._should_full_scan():
             watermark = None
@@ -368,11 +426,7 @@ class SyncRunner:
                 }
 
                 if watermark:
-                    payload["filter"] = {
-                        "property": "Updated",
-                        "date": {"on_or_after": watermark}
-                    }
-
+                    payload["filter"] = {"property": "Updated","date": {"on_or_after": watermark}}
                 if next_cursor:
                     payload["start_cursor"] = next_cursor
 
@@ -391,69 +445,32 @@ class SyncRunner:
                         if not key:
                             continue
 
-                        # 1) Try alias list
-                        st_prop = prop_first(props, [
-                            "Status (Jira)","Issue Status","State",
-                            "Status name","Status Name","Jira Status",
-                            "Current status","Workflow State","Workflow status","Status category",
-                            "Status"
-                        ])
-
-                        st_val = enum_safe("Status", norm_status(st_prop)) if st_prop else ""
-
-                        # 2) Fallback scan if still blank
-                        if not st_val:
-                            st_val = enum_safe("Status", extract_any_status(props))
-
                         mapped = {
                             "Key": key,
-                            "Summary": norm_people_or_text(
-                                prop_first(props, ["Summary","Title","Issue summary","Name"])
-                            ),
-                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(
-                                prop_first(props, ["Issue Type","Type","Issue type"])
+                            "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
+                            "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
+                            # Prefer board-visible "Status" over Jira-internal variants last
+                            "Status": enum_safe("Status", norm_status(
+                                prop_first(props, [
+                                    "Status (Jira)","Issue Status","State",
+                                    "Status name","Status Name","Jira Status",
+                                    "Current status","Workflow State","Workflow status","Status category",
+                                    "Status"
+                                ])
                             )),
-                            "Status": st_val,
-                            "Priority": enum_safe("Priority", norm_people_or_text(
-                                prop_first(props, ["Priority","Issue Priority"])
-                            )),
-                            "Reporter": norm_people_or_text(
-                                prop_first(props, ["Reporter","Reported By","Creator"])
-                            ),
-                            "Assignee": norm_people_or_text(
-                                prop_first(props, ["Assignee","Owner","Assigned To"])
-                            ),
-                            "Sprint": norm_people_or_text(
-                                prop_first(props, ["Sprint","Iteration","Milestone"])
-                            ),
-                            "Epic Link": norm_people_or_text(
-                                prop_first(props, ["Epic Link","Epic","Parent Epic"])
-                            ),
-                            "Parent": norm_people_or_text(
-                                prop_first(props, ["Parent","Parent Issue"])
-                            ),
-                            "Labels": norm_labels(
-                                prop_first(props, ["Labels","Label","Tags"])
-                            ),
-                            "Jira URL": norm_url(
-                                prop_first(props, ["Jira URL","URL","Link"])
-                            ),
-                            "Created": norm_date_prop(
-                                prop_first(props, ["Created","Created time","Created Time"])
-                            )[0],
-                            "Updated": extract_updated(
-                                prop_first(props, ["Updated","Updated time","Last Updated"]),
-                                last_edited
-                            ),
-                            "Resolved": norm_date_prop(
-                                prop_first(props, ["Resolved","Resolution date"])
-                            )[0],
-                            "Due date": norm_date_prop(
-                                prop_first(props, ["Due date","Due Date","Due"])
-                            )[0],
-                            "Story Points": norm_number(
-                                prop_first(props, ["Story Points","Points","SP"])
-                            ),
+                            "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
+                            "Reporter": norm_people_or_text(prop_first(props, ["Reporter","Reported By","Creator"])),
+                            "Assignee": norm_people_or_text(prop_first(props, ["Assignee","Owner","Assigned To"])),
+                            "Sprint": norm_people_or_text(prop_first(props, ["Sprint","Iteration","Milestone"])),
+                            "Epic Link": norm_people_or_text(prop_first(props, ["Epic Link","Epic","Parent Epic"])),
+                            "Parent": norm_people_or_text(prop_first(props, ["Parent","Parent Issue"])),
+                            "Labels": norm_labels(prop_first(props, ["Labels","Label","Tags"])),
+                            "Jira URL": norm_url(prop_first(props, ["Jira URL","URL","Link"])),
+                            "Created": norm_date_prop(prop_first(props, ["Created","Created time","Created Time"]))[0],
+                            "Updated": extract_updated(prop_first(props, ["Updated","Updated time","Last Updated"]), last_edited),
+                            "Resolved": norm_date_prop(prop_first(props, ["Resolved","Resolution date"]))[0],
+                            "Due date": norm_date_prop(prop_first(props, ["Due date","Due Date","Due"]))[0],
+                            "Story Points": norm_number(prop_first(props, ["Story Points","Points","SP"])),
                         }
 
                         if mapped["Updated"]:
@@ -482,7 +499,8 @@ class SyncRunner:
             "skipped": self.stats["skipped"],
             "errors": self.stats["errors"],
             "new_watermark": self.new_watermark,
-            "status_empty_count": self.status_empty_count,
+            "status_mapped": self.status_mapped,
+            "status_skipped": self.status_skipped
         }, indent=2))
 
 # ---------- Entry Point ----------
