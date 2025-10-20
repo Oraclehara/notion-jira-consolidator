@@ -634,6 +634,52 @@ class SyncRunner:
             return True
         return dt.datetime.utcnow().weekday() == int(os.getenv("FULL_SCAN_WEEKDAY", "6"))
 
+    def _extract_status_value(self, props: Dict[str, Any]) -> str:
+    """
+    Resolve a status value from a variety of source shapes:
+    - direct status/select/rich_text/etc
+    - relation → fetch related page → read its Status (or common variants)
+    Returns a plain string (possibly empty).
+    """
+    # 1) Prefer exact field then fallback to fuzzy
+    src_status_prop = props.get("Status") or prop_first(props, [
+        "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
+        "Jira Status","Current status","Workflow State"
+    ])
+    if not src_status_prop:
+        return ""
+
+    t = src_status_prop.get("type")
+    # 2) If the source status is a relation, dereference it
+    if t == "relation":
+        rel = (src_status_prop.get("relation") or [])
+        for it in rel:
+            pid = it.get("id")
+            if not pid:
+                continue
+            try:
+                pg = self.notion.page_retrieve(pid)
+                p2 = (pg or {}).get("properties", {}) or {}
+                # Try the most likely property names on the related page
+                related_status_prop = p2.get("Status") or prop_first(p2, [
+                    "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
+                    "Jira Status","Current status","Workflow State"
+                ])
+                val = norm_status(related_status_prop)
+                if os.getenv("DEBUG_STATUS", "") == "1":
+                    print(f"DEBUG_STATUS relation→page {pid} resolved_status='{val}'")
+                if val:
+                    return val
+            except Exception as e:
+                if os.getenv("DEBUG_STATUS", "") == "1":
+                    print(f"DEBUG_STATUS relation deref failed for {pid}: {e}")
+        # If nothing resolved from the related pages, return empty
+        return ""
+
+    # 3) Not a relation → just normalize directly
+    return norm_status(src_status_prop)
+
+
     # --- Main run ---
 
     def run(self):
@@ -702,15 +748,15 @@ class SyncRunner:
                         )
 
                         # Prefer exact field first; then fall back to fuzzy list
-                        src_status_prop = props.get("Status") or prop_first(props, [
-                            "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
-                            "Jira Status","Current status","Workflow State"
-                        ])
+                        status_val = self._extract_status_value(props)
                         
                         if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
-                            t = (src_status_prop or {}).get("type") if isinstance(src_status_prop, dict) else type(src_status_prop).__name__
-                            print(f"DEBUG_STATUS src_key={key} src_status_type={t} "
-                                  f"raw='{norm_status(src_status_prop)}'")
+                            st_prop = props.get("Status") or prop_first(props, [
+                                "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
+                                "Jira Status","Current status","Workflow State"
+                            ])
+                            st_type = (st_prop or {}).get("type") if isinstance(st_prop, dict) else type(st_prop).__name__
+                            print(f"DEBUG_STATUS src_key={key} src_status_type={st_type} resolved='{status_val}'")
 
                         mapped = {
                             "Key": key,
