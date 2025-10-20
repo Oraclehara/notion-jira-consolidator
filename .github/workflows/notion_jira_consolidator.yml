@@ -37,12 +37,28 @@ jobs:
           CONSOLIDATED_DB_ID: ${{ secrets.CONSOLIDATED_DB_ID }}
           SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
           SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
-         # MAX_PAGES_PER_RUN: ${{ vars.MAX_PAGES_PER_RUN || 50 }}
-          MAX_PAGES_PER_RUN: 20
-          PAGE_SIZE: ${{ vars.PAGE_SIZE || 100 }}
-          BATCH_SIZE: ${{ vars.BATCH_SIZE || 10 }}
-          SLEEP_SECS: ${{ vars.SLEEP_SECS || 0.4 }}
-          FULL_SCAN_WEEKDAY: ${{ vars.FULL_SCAN_WEEKDAY || 6 }}
+        
+          # Make it a true full backfill this run
           FORCE_FULL_SCAN: '1'
+          MAX_PAGES_PER_RUN: 200          # keep modest to see logs quickly
+          PAGE_SIZE: 100
+          BATCH_SIZE: 10
+          SLEEP_SECS: 0.4
+        
+          # NEW: force updates & show debug
+          FORCE_UPDATE_ALL: '1'           # <— REMOVE after this test run
+          DEBUG: '1'                      # <— REMOVE after we confirm names
+#        env:
+#          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+#          CONSOLIDATED_DB_ID: ${{ secrets.CONSOLIDATED_DB_ID }}
+#          SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
+#          SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
+#         # MAX_PAGES_PER_RUN: ${{ vars.MAX_PAGES_PER_RUN || 50 }}
+#          MAX_PAGES_PER_RUN: 20
+#          PAGE_SIZE: ${{ vars.PAGE_SIZE || 100 }}
+#          BATCH_SIZE: ${{ vars.BATCH_SIZE || 10 }}
+#          SLEEP_SECS: ${{ vars.SLEEP_SECS || 0.4 }}
+#          FULL_SCAN_WEEKDAY: ${{ vars.FULL_SCAN_WEEKDAY || 6 }}
+#          FORCE_FULL_SCAN: '1'
          # FORCE_FULL_SCAN: ${{ vars.FORCE_FULL_SCAN || '' }}
         run: python scripts/sync_jira_notionsrc.py
