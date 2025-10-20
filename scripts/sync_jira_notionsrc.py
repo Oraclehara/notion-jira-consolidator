@@ -331,6 +331,7 @@ class SyncRunner:
             "Key": title(mapped["Key"]),
             "Summary": rich(mapped.get("Summary","")),
             "Issue Type": sel(mapped.get("Issue Type","")),
+            "Status": sel(mapped.get("Status","")),
             "Priority": sel(mapped.get("Priority","")),
             "Reporter": rich(mapped.get("Reporter","")),
             "Assignee": rich(mapped.get("Assignee","")),
