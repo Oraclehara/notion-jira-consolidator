@@ -222,6 +222,38 @@ def _debug_prop_names(props: Dict[str, Any], key_label: str):
     except Exception as e:
         print("DEBUG error while printing prop names:", e)
 
+# ---------- Dynamic Status Option Helper ----------
+
+def ensure_select_option(notion: Notion, db_id: str, property_name: str, option_name: str):
+    """Ensure a Notion select property has the given option, create it if missing."""
+    if not option_name:
+        return option_name
+    try:
+        db = notion._req("GET", f"/databases/{db_id}")
+        props = db.get("properties", {})
+        prop = props.get(property_name, {})
+        if not prop:
+            return option_name
+        if prop.get("type") == "select":
+            existing = [o["name"] for o in prop["select"].get("options", [])]
+            if option_name not in existing:
+                notion._req("PATCH", f"/databases/{db_id}", json={
+                    "properties": {
+                        property_name: {
+                            "select": {
+                                "options": [{"name": option_name}]
+                            }
+                        }
+                    }
+                })
+                print(f"INFO: Added new select option '{option_name}' to '{property_name}'")
+        else:
+            # If property is 'status', just skip creation (Notion API limitation)
+            pass
+    except Exception as e:
+        print(f"WARNING: Failed to ensure option '{option_name}' for '{property_name}': {e}")
+    return option_name
+
 # ---------- Sync Logic ----------
 
 class SyncRunner:
@@ -327,11 +359,16 @@ class SyncRunner:
 
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
         src_hash = compute_source_hash(mapped)
+# Handle Status intelligently (auto-add new options if select type)
+        mapped_status = mapped.get("Status", "")
+        if mapped_status:
+            mapped_status = ensure_select_option(self.notion, self.consolidated_db, "Status", mapped_status)
+        
         props = {
             "Key": title(mapped["Key"]),
             "Summary": rich(mapped.get("Summary","")),
             "Issue Type": sel(mapped.get("Issue Type","")),
-            "Status": sel(mapped.get("Status","")),
+            "Status": sel(mapped_status),   # use select for dynamic creation
             "Priority": sel(mapped.get("Priority","")),
             "Reporter": rich(mapped.get("Reporter","")),
             "Assignee": rich(mapped.get("Assignee","")),
