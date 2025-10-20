@@ -25,12 +25,12 @@ class Notion:
         for _ in range(8):
             try:
                 resp = SESSION.request(method, url, headers=self.h, timeout=40, **kw)
-            except requests.exceptions.RequestException as e:
+            except requests.exceptions.RequestException:
                 # retry on transient network errors (timeouts, connection resets, etc.)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
                 continue
-    
+
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", backoff))
                 time.sleep(max(retry_after, backoff))
@@ -40,11 +40,11 @@ class Notion:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
                 continue
-    
+
             if not resp.ok:
                 # bubble up errors; callers may handle some 400s with fallback
                 raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text}")
-    
+
             return resp.json()
         raise RuntimeError("Exceeded retry attempts against Notion API")
 
@@ -90,7 +90,7 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
     if t == "rich_text":
         return "".join(rt.get("plain_text","") for rt in prop.get("rich_text", [])).strip()
     if t == "title":
-        return "".join(rt.get("plain_text","") for rt in prop.get("title", [])).strip()
+        return "".join(rt.get("plain_text","") for rt in p.get("title", [])).strip()
     if t == "select":
         sel = prop.get("select")
         return (sel or {}).get("name") or ""
@@ -464,58 +464,61 @@ class SyncRunner:
         results = res.get("results", [])
         return results[0] if results else None
 
-    def _create_or_update_with_status_fallback(self, current: Optional[Dict[str, Any]], base_props: Dict[str, Any],
-                                           status_payload_candidates: List[Dict[str, Any]]) -> None:
-    """
-    Attempts to create/update the page, trying Status payload candidates in order.
-    If a 400 validation error occurs, it retries with the next candidate.
-    """
-    # no Status field at all
-    if not status_payload_candidates:
-        # create/update without Status
+    def _create_or_update_with_status_fallback(
+        self,
+        current: Optional[Dict[str, Any]],
+        base_props: Dict[str, Any],
+        status_payload_candidates: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Attempts to create/update the page, trying Status payload candidates in order.
+        If a 400 validation error occurs, it retries with the next candidate.
+        """
+        # no Status field at all
+        if not status_payload_candidates:
+            if current is None:
+                self.notion.page_create(self.consolidated_db, base_props)
+                self.stats["created"] += 1
+            else:
+                self.notion.page_update(current["id"], base_props)
+                self.stats["updated"] += 1
+            return
+
+        # Try candidates in order
+        last_err = None
+        for cand in status_payload_candidates:
+            props = dict(base_props)
+            props["Status"] = cand
+            try:
+                if current is None:
+                    self.notion.page_create(self.consolidated_db, props)
+                    self.stats["created"] += 1
+                else:
+                    self.notion.page_update(current["id"], props)
+                    self.stats["updated"] += 1
+                return
+            except Exception as e:
+                last_err = e
+                if _is_validation_error(e):
+                    # try next candidate
+                    continue
+                # Non-validation error -> re-raise
+                raise
+
+        # If we exhausted candidates due to validation errors, log and proceed without Status
+        print(f"INFO: All Status payload variants failed validation; saving without Status. reason={last_err}")
         if current is None:
             self.notion.page_create(self.consolidated_db, base_props)
             self.stats["created"] += 1
         else:
             self.notion.page_update(current["id"], base_props)
             self.stats["updated"] += 1
-        return
-
-    # Try candidates in order
-    last_err = None
-    for cand in status_payload_candidates:
-        props = dict(base_props)
-        props["Status"] = cand
-        try:
-            if current is None:
-                self.notion.page_create(self.consolidated_db, props)
-                self.stats["created"] += 1
-            else:
-                self.notion.page_update(current["id"], props)
-                self.stats["updated"] += 1
-            return
-        except Exception as e:
-            last_err = e
-            if _is_validation_error(e):
-                # try next candidate
-                continue
-            # Non-validation error -> re-raise
-            raise
-
-    # If we exhausted candidates due to validation errors, log and proceed without Status
-    print(f"INFO: All Status payload variants failed validation; saving without Status. reason={last_err}")
-    if current is None:
-        self.notion.page_create(self.consolidated_db, base_props)
-        self.stats["created"] += 1
-    else:
-        self.notion.page_update(current["id"], base_props)
-        self.stats["updated"] += 1
 
     # --- Upsert with robust Status handling ---
 
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
         raw_status = (mapped.get("Status") or "").strip()
-    
+
         # Build base (everything except Status)
         src_hash = compute_source_hash(mapped)
         base_props = {
@@ -538,10 +541,11 @@ class SyncRunner:
             "Source Hash": rich(src_hash),
             "Source Database": rich(src_db_id),
         }
-    
+
         # Decide if content changed; if not changed, skip early (but only if not forcing)
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is not None and os.getenv("FORCE_UPDATE_ALL", "") != "1":
+            cur_hash = ""
             try:
                 prop = current.get("properties", {}).get("Source Hash", {})
                 cur_hash = "".join(t.get("plain_text","") for t in prop.get("rich_text", []))
@@ -550,7 +554,7 @@ class SyncRunner:
             if cur_hash == src_hash:
                 self.stats["skipped"] += 1
                 return
-    
+
         # Build candidate Status payloads (order depends on detected schema; falls back if unknown)
         status_candidates = _build_status_payloads(
             raw_status,
@@ -559,9 +563,10 @@ class SyncRunner:
             self.notion,
             self.consolidated_db,
         )
-    
+
         # Try to create/update with fallback between select/status payloads
         self._create_or_update_with_status_fallback(current, base_props, status_candidates)
+
     def _should_full_scan(self) -> bool:
         if os.getenv("FORCE_FULL_SCAN"):
             return True
