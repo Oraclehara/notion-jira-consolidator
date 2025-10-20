@@ -327,6 +327,29 @@ def ms(csv_text: Optional[str]) -> Dict[str, Any]:
                 vals.append({"name": name})
     return {"multi_select": vals}
 
+def _debug_prop_names(props: Dict[str, Any], key_label: str, limit: int = 3):
+    """
+    Print the property keys and the raw shapes of likely Reporter/Assignee props
+    for a few rows only when DEBUG=1 is set.
+    """
+    if os.getenv("DEBUG", "") != "1":
+        return
+    # Show all property names once per a few items
+    try:
+        keys = list(props.keys())
+        print(f"DEBUG[{key_label}] props keys: {keys[:40]}{'...' if len(keys)>40 else ''}")
+
+        # Print candidates that contain these substrings (case-insensitive)
+        want = ["reporter", "assignee", "related jira reporter", "related jira assignee"]
+        for k in keys:
+            lk = k.lower()
+            if any(w in lk for w in want):
+                v = props.get(k)
+                t = v.get("type") if isinstance(v, dict) else type(v).__name__
+                print(f"DEBUG[{key_label}] candidate '{k}' type={t} value-head={str(v)[:200]}")
+    except Exception as e:
+        print("DEBUG error while printing prop names:", e)
+
 # ---------- Sync Logic ----------
 
 class SyncRunner:
@@ -416,11 +439,20 @@ class SyncRunner:
                 cur_hash = "".join(t.get("plain_text","") for t in prop.get("rich_text", []))
             except Exception:
                 cur_hash = ""
-            if cur_hash == src_hash:
+ #           if cur_hash == src_hash:
+  #              self.stats["skipped"] += 1
+   #         else:
+    #            self.notion.page_update(current["id"], props)
+     #           self.stats["updated"] += 1
+            if os.getenv("FORCE_UPDATE_ALL", "") == "1":
+                self.notion.page_update(current["id"], props)
+                self.stats["updated"] += 1
+            elif cur_hash == src_hash:
                 self.stats["skipped"] += 1
             else:
                 self.notion.page_update(current["id"], props)
                 self.stats["updated"] += 1
+# Above is the ignore hash for one run
 
     def _should_full_scan(self) -> bool:
         if os.getenv("FORCE_FULL_SCAN"):
@@ -465,6 +497,9 @@ class SyncRunner:
                     try:
                         props = r.get("properties", {})
                         last_edited = r.get("last_edited_time")
+                        # Print prop names on a few rows to learn real field names/types
+                        if (self.stats["fetched"] <= 3) and os.getenv("DEBUG", "") == "1":
+                            _debug_prop_names(props, key_label=f"{src_db}:{self.stats['fetched']}")
 
                         key = norm_key(norm_people_or_text(props.get("Key")))
                         if not key:
