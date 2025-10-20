@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — relation-aware people resolution
+# Notion-based Jira Consolidator (No Jira API) — relation-aware people resolution + robust Status write
 
 import os, sys, time, json, hashlib, datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
@@ -203,7 +203,7 @@ def ms(csv_text: Optional[str]) -> Dict[str, Any]:
                 vals.append({"name": name})
     return {"multi_select": vals}
 
-# ---------- Debug helper ----------
+# ---------- Debug helpers ----------
 
 def _debug_prop_names(props: Dict[str, Any], key_label: str):
     if os.getenv("DEBUG", "") != "1":
@@ -221,6 +221,10 @@ def _debug_prop_names(props: Dict[str, Any], key_label: str):
                 print(f"DEBUG[{key_label}] candidate '{k}' type={t} value-head={head}")
     except Exception as e:
         print("DEBUG error while printing prop names:", e)
+
+def _dbg_status(msg: str):
+    if os.getenv("DEBUG_STATUS", "") == "1":
+        print(msg)
 
 # ---------- Consolidated Status Schema Helpers ----------
 
@@ -246,54 +250,39 @@ def _fetch_consolidated_status_spec(notion: Notion, db_id: str) -> Tuple[str, Li
         print(f"WARNING: failed to read Consolidated.Status schema: {e}")
         return "", []
 
-def _map_status_to_existing(status_name: str, options: List[str]) -> Optional[str]:
-    """Map an incoming Jira status to one of the existing Notion options."""
-    if not status_name or not options:
+def _map_status_to_existing(name: str, existing: List[str]) -> Optional[str]:
+    """
+    Map an incoming Jira status to one of the existing Notion status options.
+    Case-insensitive exact match, then alias mapping, then light word overlap.
+    """
+    if not name:
         return None
-
-    s = status_name.strip()
-    opts_lower = [o.lower() for o in options]
-
-    # 1) Exact, case-insensitive
-    if s.lower() in opts_lower:
-        return options[opts_lower.index(s.lower())]
-
-    # 2) Normalize punctuation/spaces
-    def norm(x: str) -> str:
-        return x.replace("-", " ").replace("_", " ").replace(".", " ").strip().lower()
-
-    s_norm = norm(s)
-    for i, o in enumerate(options):
-        if norm(o) == s_norm:
-            return options[i]
-
-    # 3) Contains / contained-by heuristics
-    for i, o in enumerate(options):
-        if s_norm in o.lower() or o.lower() in s_norm:
-            return options[i]
-
-    # 4) Common Jira→Notion buckets
-    aliases = {
-        "to do": ["TO DO", "To do", "To Do", "todo", "to-do", "open", "backlog", "new"],
-        "in progress": ["in-progress", "doing", "started", "implementation", "wip"],
-        "in review": ["review", "code review", "peer review", "pr review"],
-        "ready for testing": ["qa", "ready for qa", "testing", "in qa", "qa ready"],
-        "blocked": ["on hold", "waiting"],
-        "done": ["closed", "resolved", "complete", "completed", "fixed", "merged"],
+    name_norm = _safe_lower(name)
+    # 1) exact case-insensitive match
+    for opt in existing:
+        if _safe_lower(opt) == name_norm:
+            return opt
+    # 2) aliases
+    ALIASES = {
+        "to do": ["todo", "to-do", "to_do", "to  do"],
+        "in progress": ["doing", "wip", "in-progress", "in  progress"],
+        "ready for testing": ["qa ready", "ready for qa", "ready-for-testing"],
+        "in review": ["code review", "review"],
+        "blocked": ["on hold", "on-hold"],
+        "done": ["completed", "resolved", "closed"],
+        "not started": ["backlog", "new"],
     }
-    for target, syns in aliases.items():
-        if s_norm == target or s_norm in syns:
-            # Prefer exact target if present
-            for i, o in enumerate(options):
-                if o.lower() == target:
-                    return options[i]
-            # Otherwise any option containing the target phrase
-            for i, o in enumerate(options):
-                if target in o.lower():
-                    return options[i]
-
+    for canonical, variants in ALIASES.items():
+        if name_norm == canonical or name_norm in variants:
+            for opt in existing:
+                if _safe_lower(opt) in ([canonical] + variants):
+                    return opt
+    # 3) light word overlap
+    parts = set(name_norm.split())
+    for opt in existing:
+        if parts & set(_safe_lower(opt).split()):
+            return opt
     return None
-
 
 # ---------- Dynamic Status Option Helper ----------
 
@@ -320,9 +309,6 @@ def ensure_select_option(notion: Notion, db_id: str, property_name: str, option_
                     }
                 })
                 print(f"INFO: Added new select option '{option_name}' to '{property_name}'")
-        else:
-            # If property is 'status', just skip creation (Notion API limitation)
-            pass
     except Exception as e:
         print(f"WARNING: Failed to ensure option '{option_name}' for '{property_name}': {e}")
     return option_name
@@ -350,12 +336,12 @@ class SyncRunner:
         """Pick the title text from an arbitrary page object."""
         props = page.get("properties", {}) or {}
         # Prefer the Notion title-typed property
-        for name, p in props.items():
+        for _, p in props.items():
             if isinstance(p, dict) and p.get("type") == "title":
                 txt = "".join(rt.get("plain_text","") for rt in p.get("title", []))
                 if txt.strip():
                     return txt.strip()
-        # Fallback: common name fields as rich_text
+        # Fallbacks
         for candidate in ["Name","Full Name","Display Name","Title"]:
             p = props.get(candidate)
             if isinstance(p, dict):
@@ -399,7 +385,6 @@ class SyncRunner:
             v = self._relation_to_names(p)
             if v:
                 return v
-        # fall back to regular textual/people extraction
         return norm_people_or_text(p)
 
     # --- Control DB (watermark) ---
@@ -421,7 +406,7 @@ class SyncRunner:
     def _set_control_value(self, row_id: str, iso_str: Optional[str]):
         self.notion.page_update(row_id, {"Last Watermark (Date)": date(iso_str)})
 
-    # --- Consolidated DB upsert ---
+    # --- Consolidated DB lookup ---
 
     def consolidated_find_by_key(self, key: str) -> Optional[Dict[str, Any]]:
         payload = {
@@ -432,30 +417,32 @@ class SyncRunner:
         results = res.get("results", [])
         return results[0] if results else None
 
+    # --- Upsert with robust Status handling ---
+
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
-        # Prepare Status according to consolidated schema
         raw_status = (mapped.get("Status") or "").strip()
+        ctype = self.consolidated_status_type
+        coptions = self.consolidated_status_options
+
         status_payload = None
-    
-        ctype = getattr(self, "consolidated_status_type", None)
-        coptions = getattr(self, "consolidated_status_options", [])
-    
         if raw_status:
             if ctype == "select":
                 ensured = ensure_select_option(self.notion, self.consolidated_db, "Status", raw_status)
                 status_payload = {"select": {"name": ensured}}
+                _dbg_status(f"STATUS(select) key={mapped.get('Key')} raw='{raw_status}' -> '{ensured}'")
             elif ctype == "status":
                 mapped_opt = _map_status_to_existing(raw_status, coptions)
                 if mapped_opt:
                     status_payload = {"status": {"name": mapped_opt}}
+                    _dbg_status(f"STATUS(status) key={mapped.get('Key')} raw='{raw_status}' -> '{mapped_opt}'")
                 else:
-                    print(f"INFO: Skipping Status set for '{mapped.get('Key','?')}' "
-                          f"because '{raw_status}' not found in consolidated options.")
+                    _dbg_status(f"STATUS(status) key={mapped.get('Key')} raw='{raw_status}' -> SKIP (no mapping)")
             else:
-                # Unknown schema: try select as a safe fallback
+                # Unknown schema: try select just in case.
                 status_payload = {"select": {"name": raw_status}}
-    
-        # Build props (omit Status for now; add only if we have a valid payload)
+                _dbg_status(f"STATUS(unknown) key={mapped.get('Key')} raw='{raw_status}' -> select payload")
+
+        # Build other props
         src_hash = compute_source_hash(mapped)
         props = {
             "Key": title(mapped["Key"]),
@@ -479,74 +466,40 @@ class SyncRunner:
         }
         if status_payload:
             props["Status"] = status_payload
-    
-        # Helper: read current Status name from a page
-        def _current_status_name(page: Dict[str, Any]) -> str:
-            p = (page.get("properties", {}) or {}).get("Status")
-            if not isinstance(p, dict):
-                return ""
-            t = p.get("type")
-            if t == "status":
-                st = p.get("status") or {}
-                return (st.get("name") or "").strip()
-            if t == "select":
-                sel = p.get("select") or {}
-                return (sel.get("name") or "").strip()
-            return ""
-    
-        # Derive desired status name (for comparison)
-        desired_status_name = ""
-        if status_payload:
-            if "status" in status_payload:
-                desired_status_name = (status_payload["status"].get("name") or "").strip()
-            elif "select" in status_payload:
-                desired_status_name = (status_payload["select"].get("name") or "").strip()
-    
+
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
-            # Create new page
             self.notion.page_create(self.consolidated_db, props)
             self.stats["created"] += 1
         else:
-            # Compare against existing
             cur_hash = ""
             try:
                 prop = current.get("properties", {}).get("Source Hash", {})
                 cur_hash = "".join(t.get("plain_text","") for t in prop.get("rich_text", []))
             except Exception:
                 cur_hash = ""
-    
-            # Read current consolidated Status
-            current_status_name = _current_status_name(current)
-    
-            # Decide if we must update:
-            must_update = os.getenv("FORCE_UPDATE_ALL", "") == "1"
-            if not must_update:
-                # If the hash hasn't changed but Status differs (and we have a desired status), update anyway
-                if cur_hash == src_hash:
-                    if desired_status_name and (desired_status_name != current_status_name):
-                        must_update = True
-    
-            if must_update or cur_hash != src_hash:
+            if os.getenv("FORCE_UPDATE_ALL", "") == "1":
                 self.notion.page_update(current["id"], props)
                 self.stats["updated"] += 1
-            else:
+            elif cur_hash == src_hash:
                 self.stats["skipped"] += 1
-
+            else:
+                self.notion.page_update(current["id"], props)
+                self.stats["updated"] += 1
 
     def _should_full_scan(self) -> bool:
         if os.getenv("FORCE_FULL_SCAN"):
             return True
         return dt.datetime.utcnow().weekday() == int(os.getenv("FULL_SCAN_WEEKDAY", "6"))
 
-    # --- Main run --- #
+    # --- Main run ---
 
     def run(self):
         control_row_id, watermark = self._get_control_row_id_and_value()
         if self._should_full_scan():
             watermark = None
-    
-        # Detect Consolidated.Status schema once (ALWAYS run this, not only on full scans)
+
+        # Detect Consolidated.Status schema once (ALWAYS)
         self.consolidated_status_type, self.consolidated_status_options = _fetch_consolidated_status_spec(
             self.notion, self.consolidated_db
         )
@@ -555,13 +508,13 @@ class SyncRunner:
                   f"({len(self.consolidated_status_options)} options)")
         else:
             print("WARNING: Could not determine Consolidated.Status property type")
-    
+
         for src_db in self.source_db_ids:
             next_cursor = None
             while True:
                 if self.stats["fetched"] >= self.max_pages:
                     break
-    
+
                 payload: Dict[str, Any] = {
                     "page_size": self.page_size,
                     "sorts": [
@@ -569,35 +522,34 @@ class SyncRunner:
                         {"timestamp": "last_edited_time", "direction": "descending"},
                     ],
                 }
-    
+
                 if watermark:
                     payload["filter"] = {
                         "property": "Updated",
                         "date": {"on_or_after": watermark}
                     }
-    
+
                 if next_cursor:
                     payload["start_cursor"] = next_cursor
-    
+
                 data = self.notion.db_query(src_db, payload)
                 results = data.get("results", [])
                 next_cursor = data.get("next_cursor")
                 has_more = data.get("has_more", False)
-    
+
                 for r in results:
                     self.stats["fetched"] += 1
                     try:
                         props = r.get("properties", {})
                         last_edited = r.get("last_edited_time")
-    
-                        # print a few rows for field discovery
+
                         if self.stats["fetched"] <= 3 and os.getenv("DEBUG", "") == "1":
                             _debug_prop_names(props, key_label=f"{src_db}:{self.stats['fetched']}")
-    
+
                         key = norm_key(norm_people_or_text(props.get("Key")))
                         if not key:
                             continue
-    
+
                         reporter_val = self._extract_person_like(
                             props,
                             ["Related Jira Reporter","Reporter","Reporter (Jira)","Reported By","Creator","Author","Reporter Name"]
@@ -606,16 +558,16 @@ class SyncRunner:
                             props,
                             ["Related Jira Assignee","Assignee","Assignee (Jira)","Assigned To","Owner","Handler","Assignee Name"]
                         )
-    
+
+                        src_status_prop = prop_first(props, [
+                            "Status","Status (Jira)","Issue Status","State","Status name","Status Name","Jira Status","Current status","Workflow State"
+                        ])
+
                         mapped = {
                             "Key": key,
                             "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
                             "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
-                            "Status": enum_safe("Status", norm_status(
-                                prop_first(props, [
-                                    "Status","Status (Jira)","Issue Status","State","Status name","Status Name","Jira Status","Current status","Workflow State"
-                                ])
-                            )),
+                            "Status": enum_safe("Status", norm_status(src_status_prop)),
                             "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
                             "Reporter": reporter_val,
                             "Assignee": assignee_val,
@@ -630,26 +582,30 @@ class SyncRunner:
                             "Due date": norm_date_prop(prop_first(props, ["Due Date","Due date","Due"]))[0],
                             "Story Points": norm_number(prop_first(props, ["Story Points","Points","SP"])),
                         }
-    
+
+                        if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
+                            print(f"DEBUG_STATUS src_key={key} src_status='{norm_status(src_status_prop)}' "
+                                  f"mapped='{mapped['Status']}'")
+
                         if mapped["Updated"]:
                             if self.new_watermark is None or mapped["Updated"] > self.new_watermark:
                                 self.new_watermark = mapped["Updated"]
-    
+
                         self.consolidated_upsert(mapped, src_db)
-    
+
                         if (self.stats["created"] + self.stats["updated"]) % self.batch_size == 0:
                             time.sleep(self.sleep_secs)
-    
+
                     except Exception as e:
                         self.stats["errors"] += 1
                         print(f"ERROR key={props.get('Key') if 'props' in locals() else '?'} reason={e}")
-    
+
                 if not has_more:
                     break
-    
+
         if self.new_watermark and control_row_id:
             self._set_control_value(control_row_id, self.new_watermark)
-    
+
         print(json.dumps({
             "fetched": self.stats["fetched"],
             "created": self.stats["created"],
@@ -658,7 +614,6 @@ class SyncRunner:
             "errors": self.stats["errors"],
             "new_watermark": self.new_watermark,
         }, indent=2))
-
 
 # ---------- Entry Point ----------
 
