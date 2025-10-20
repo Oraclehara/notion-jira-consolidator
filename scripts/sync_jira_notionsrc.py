@@ -222,6 +222,71 @@ def _debug_prop_names(props: Dict[str, Any], key_label: str):
     except Exception as e:
         print("DEBUG error while printing prop names:", e)
 
+# ---------- Consolidated Status Schema Helpers ----------
+
+def _safe_lower(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+def _fetch_consolidated_status_spec(notion: Notion, db_id: str) -> Tuple[str, List[str]]:
+    """
+    Return (ptype, options) where ptype in {"status","select",""} for Consolidated.Status,
+    and options is the current list of option names (empty if not applicable).
+    """
+    try:
+        db = notion._req("GET", f"/databases/{db_id}")
+        prop = (db.get("properties") or {}).get("Status") or {}
+        ptype = prop.get("type") or ""
+        options: List[str] = []
+        if ptype == "status":
+            options = [o.get("name","") for o in (prop.get("status") or {}).get("options", [])]
+        elif ptype == "select":
+            options = [o.get("name","") for o in (prop.get("select") or {}).get("options", [])]
+        return ptype, options
+    except Exception as e:
+        print(f"WARNING: failed to read Consolidated.Status schema: {e}")
+        return "", []
+
+def _map_status_to_existing(name: str, existing: List[str]) -> Optional[str]:
+    """
+    Try to map an incoming Jira status to one of the existing Notion status options.
+    - Case-insensitive exact match first.
+    - Then alias table.
+    - Otherwise return None (caller will skip setting to avoid 400s / blanks).
+    """
+    if not name:
+        return None
+    name_norm = _safe_lower(name)
+    # 1) exact case-insensitive match
+    for opt in existing:
+        if _safe_lower(opt) == name_norm:
+            return opt
+
+    # 2) alias table (adjust freely)
+    ALIASES = {
+        "to do": ["todo", "to-do", "to_do"],
+        "in progress": ["doing", "wip"],
+        "ready for testing": ["qa ready", "ready for qa", "ready-for-testing"],
+        "in review": ["code review", "review"],
+        "blocked": ["on hold", "blocked"],
+        "done": ["completed", "resolved", "closed"],
+        "not started": ["backlog", "new"],
+    }
+    for canonical, variants in ALIASES.items():
+        if name_norm == canonical or name_norm in variants:
+            # pick the first existing option that equals canonical or variant
+            for opt in existing:
+                if _safe_lower(opt) in ([canonical] + variants):
+                    return opt
+
+    # 3) sloppy fallback: first option that shares words (kept conservative)
+    parts = set(name_norm.split())
+    best = None
+    for opt in existing:
+        if parts & set(_safe_lower(opt).split()):
+            best = opt
+            break
+    return best  # might still be None
+
 # ---------- Dynamic Status Option Helper ----------
 
 def ensure_select_option(notion: Notion, db_id: str, property_name: str, option_name: str):
@@ -258,6 +323,8 @@ def ensure_select_option(notion: Notion, db_id: str, property_name: str, option_
 
 class SyncRunner:
     def __init__(self, notion: Notion, consolidated_db: str, sync_control_db: str, source_db_ids: List[str]):
+        self.consolidated_status_type: str = ""
+        self.consolidated_status_options: List[str] = []
         self.notion = notion
         self.consolidated_db = consolidated_db
         self.sync_control_db = sync_control_db
@@ -358,17 +425,38 @@ class SyncRunner:
         return results[0] if results else None
 
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
+        # Prepare Status according to consolidated schema
+        raw_status = (mapped.get("Status") or "").strip()
+        status_payload = None
+    
+        # We expect these to be populated once in run(): self.consolidated_status_type, self.consolidated_status_options
+        ctype = getattr(self, "consolidated_status_type", None)
+        coptions = getattr(self, "consolidated_status_options", [])
+    
+        if raw_status:
+            if ctype == "select":
+                # Ensure option exists then use select payload
+                ensured = ensure_select_option(self.notion, self.consolidated_db, "Status", raw_status)
+                status_payload = {"select": {"name": ensured}}
+            elif ctype == "status":
+                # Must map to an existing Status option; cannot create via API
+                mapped_opt = _map_status_to_existing(raw_status, coptions)
+                if mapped_opt:
+                    status_payload = {"status": {"name": mapped_opt}}
+                else:
+                    # No safe mapping -> do not touch Status (avoid blanking/validation errors)
+                    print(f"INFO: Skipping Status set for '{mapped.get('Key','?')}' "
+                          f"because '{raw_status}' not found in consolidated options.")
+            else:
+                # Fallback: if unknown schema, try a safe select (won't hurt if property is select)
+                status_payload = {"select": {"name": raw_status}}
+    
+        # Build props (omit Status for now; add only if we have a valid payload)
         src_hash = compute_source_hash(mapped)
-# Handle Status intelligently (auto-add new options if select type)
-        mapped_status = mapped.get("Status", "")
-        if mapped_status:
-            mapped_status = ensure_select_option(self.notion, self.consolidated_db, "Status", mapped_status)
-        
         props = {
             "Key": title(mapped["Key"]),
             "Summary": rich(mapped.get("Summary","")),
             "Issue Type": sel(mapped.get("Issue Type","")),
-            "Status": sel(mapped_status),   # use select for dynamic creation
             "Priority": sel(mapped.get("Priority","")),
             "Reporter": rich(mapped.get("Reporter","")),
             "Assignee": rich(mapped.get("Assignee","")),
@@ -385,10 +473,9 @@ class SyncRunner:
             "Source Hash": rich(src_hash),
             "Source Database": rich(src_db_id),
         }
-        # Status is a Notion "status" type in your Consolidated DB
-        if mapped.get("Status"):
-            props["Status"] = status_prop(mapped["Status"])
-
+        if status_payload:
+            props["Status"] = status_payload
+    
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
             self.notion.page_create(self.consolidated_db, props)
@@ -400,7 +487,6 @@ class SyncRunner:
                 cur_hash = "".join(t.get("plain_text","") for t in prop.get("rich_text", []))
             except Exception:
                 cur_hash = ""
-            # optional: force update one-time during diagnostics
             if os.getenv("FORCE_UPDATE_ALL", "") == "1":
                 self.notion.page_update(current["id"], props)
                 self.stats["updated"] += 1
@@ -421,6 +507,16 @@ class SyncRunner:
         control_row_id, watermark = self._get_control_row_id_and_value()
         if self._should_full_scan():
             watermark = None
+
+            # Detect Consolidated.Status schema once
+        self.consolidated_status_type, self.consolidated_status_options = _fetch_consolidated_status_spec(
+            self.notion, self.consolidated_db
+        )
+        if self.consolidated_status_type:
+            print(f"INFO Consolidated.Status type: {self.consolidated_status_type} "
+                  f"({len(self.consolidated_status_options)} options)")
+        else:
+            print("WARNING: Could not determine Consolidated.Status property type")
 
         for src_db in self.source_db_ids:
             next_cursor = None
