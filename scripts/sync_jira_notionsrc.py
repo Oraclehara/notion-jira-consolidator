@@ -23,7 +23,14 @@ class Notion:
         url = f"{NOTION_API}{path}"
         backoff = 1.0
         for _ in range(8):
-            resp = SESSION.request(method, url, headers=self.h, timeout=40, **kw)
+            try:
+                resp = SESSION.request(method, url, headers=self.h, timeout=40, **kw)
+            except requests.exceptions.RequestException as e:
+                # retry on transient network errors (timeouts, connection resets, etc.)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+    
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", backoff))
                 time.sleep(max(retry_after, backoff))
@@ -33,8 +40,11 @@ class Notion:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
                 continue
+    
             if not resp.ok:
+                # bubble up errors; callers may handle some 400s with fallback
                 raise RuntimeError(f"Notion API error {resp.status_code}: {resp.text}")
+    
             return resp.json()
         raise RuntimeError("Exceeded retry attempts against Notion API")
 
@@ -313,6 +323,43 @@ def ensure_select_option(notion: Notion, db_id: str, property_name: str, option_
         print(f"WARNING: Failed to ensure option '{option_name}' for '{property_name}': {e}")
     return option_name
 
+def _is_validation_error(e: Exception) -> bool:
+    s = str(e)
+    return "validation_error" in s or "Invalid status option" in s or "property type" in s
+
+def _build_status_payloads(raw_status: str,
+                           consolidated_type: str,
+                           consolidated_options: List[str],
+                           notion: Notion,
+                           consolidated_db: str) -> List[Dict[str, Any]]:
+    """
+    Returns an ordered list of candidate payloads for the 'Status' property.
+    We prefer the detected consolidated_type; when unknown we try both.
+    """
+    candidates: List[Dict[str, Any]] = []
+    raw = (raw_status or "").strip()
+    if not raw:
+        return candidates
+
+    # For SELECT: ensure option exists first
+    def _select_payload():
+        ensured = ensure_select_option(notion, consolidated_db, "Status", raw)
+        return {"select": {"name": ensured}}
+
+    # For STATUS: try to map to existing, else use raw (may still fail if missing)
+    def _status_payload():
+        mapped = _map_status_to_existing(raw, consolidated_options) if consolidated_options else raw
+        return {"status": {"name": mapped}}
+
+    if consolidated_type == "select":
+        candidates = [_select_payload(), _status_payload()]
+    elif consolidated_type == "status":
+        candidates = [_status_payload(), _select_payload()]
+    else:
+        # unknown: try both; Notion will reject the wrong shape and we'll fall back
+        candidates = [_select_payload(), _status_payload()]
+    return candidates
+
 # ---------- Sync Logic ----------
 
 class SyncRunner:
@@ -417,34 +464,61 @@ class SyncRunner:
         results = res.get("results", [])
         return results[0] if results else None
 
+    def _create_or_update_with_status_fallback(self, current: Optional[Dict[str, Any]], base_props: Dict[str, Any],
+                                           status_payload_candidates: List[Dict[str, Any]]) -> None:
+    """
+    Attempts to create/update the page, trying Status payload candidates in order.
+    If a 400 validation error occurs, it retries with the next candidate.
+    """
+    # no Status field at all
+    if not status_payload_candidates:
+        # create/update without Status
+        if current is None:
+            self.notion.page_create(self.consolidated_db, base_props)
+            self.stats["created"] += 1
+        else:
+            self.notion.page_update(current["id"], base_props)
+            self.stats["updated"] += 1
+        return
+
+    # Try candidates in order
+    last_err = None
+    for cand in status_payload_candidates:
+        props = dict(base_props)
+        props["Status"] = cand
+        try:
+            if current is None:
+                self.notion.page_create(self.consolidated_db, props)
+                self.stats["created"] += 1
+            else:
+                self.notion.page_update(current["id"], props)
+                self.stats["updated"] += 1
+            return
+        except Exception as e:
+            last_err = e
+            if _is_validation_error(e):
+                # try next candidate
+                continue
+            # Non-validation error -> re-raise
+            raise
+
+    # If we exhausted candidates due to validation errors, log and proceed without Status
+    print(f"INFO: All Status payload variants failed validation; saving without Status. reason={last_err}")
+    if current is None:
+        self.notion.page_create(self.consolidated_db, base_props)
+        self.stats["created"] += 1
+    else:
+        self.notion.page_update(current["id"], base_props)
+        self.stats["updated"] += 1
+
     # --- Upsert with robust Status handling ---
 
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
         raw_status = (mapped.get("Status") or "").strip()
-        ctype = self.consolidated_status_type
-        coptions = self.consolidated_status_options
-
-        status_payload = None
-        if raw_status:
-            if ctype == "select":
-                ensured = ensure_select_option(self.notion, self.consolidated_db, "Status", raw_status)
-                status_payload = {"select": {"name": ensured}}
-                _dbg_status(f"STATUS(select) key={mapped.get('Key')} raw='{raw_status}' -> '{ensured}'")
-            elif ctype == "status":
-                mapped_opt = _map_status_to_existing(raw_status, coptions)
-                if mapped_opt:
-                    status_payload = {"status": {"name": mapped_opt}}
-                    _dbg_status(f"STATUS(status) key={mapped.get('Key')} raw='{raw_status}' -> '{mapped_opt}'")
-                else:
-                    _dbg_status(f"STATUS(status) key={mapped.get('Key')} raw='{raw_status}' -> SKIP (no mapping)")
-            else:
-                # Unknown schema: try select just in case.
-                status_payload = {"select": {"name": raw_status}}
-                _dbg_status(f"STATUS(unknown) key={mapped.get('Key')} raw='{raw_status}' -> select payload")
-
-        # Build other props
+    
+        # Build base (everything except Status)
         src_hash = compute_source_hash(mapped)
-        props = {
+        base_props = {
             "Key": title(mapped["Key"]),
             "Summary": rich(mapped.get("Summary","")),
             "Issue Type": sel(mapped.get("Issue Type","")),
@@ -464,29 +538,30 @@ class SyncRunner:
             "Source Hash": rich(src_hash),
             "Source Database": rich(src_db_id),
         }
-        if status_payload:
-            props["Status"] = status_payload
-
+    
+        # Decide if content changed; if not changed, skip early (but only if not forcing)
         current = self.consolidated_find_by_key(mapped["Key"])
-        if current is None:
-            self.notion.page_create(self.consolidated_db, props)
-            self.stats["created"] += 1
-        else:
-            cur_hash = ""
+        if current is not None and os.getenv("FORCE_UPDATE_ALL", "") != "1":
             try:
                 prop = current.get("properties", {}).get("Source Hash", {})
                 cur_hash = "".join(t.get("plain_text","") for t in prop.get("rich_text", []))
             except Exception:
                 cur_hash = ""
-            if os.getenv("FORCE_UPDATE_ALL", "") == "1":
-                self.notion.page_update(current["id"], props)
-                self.stats["updated"] += 1
-            elif cur_hash == src_hash:
+            if cur_hash == src_hash:
                 self.stats["skipped"] += 1
-            else:
-                self.notion.page_update(current["id"], props)
-                self.stats["updated"] += 1
-
+                return
+    
+        # Build candidate Status payloads (order depends on detected schema; falls back if unknown)
+        status_candidates = _build_status_payloads(
+            raw_status,
+            self.consolidated_status_type,
+            self.consolidated_status_options,
+            self.notion,
+            self.consolidated_db,
+        )
+    
+        # Try to create/update with fallback between select/status payloads
+        self._create_or_update_with_status_fallback(current, base_props, status_candidates)
     def _should_full_scan(self) -> bool:
         if os.getenv("FORCE_FULL_SCAN"):
             return True
