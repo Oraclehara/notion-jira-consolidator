@@ -81,34 +81,96 @@ def norm_key(v: Any) -> str:
 def norm_people_or_text(prop: Dict[str, Any]) -> str:
     if not prop: return ""
     t = prop.get("type")
+
     if t == "people":
         names = []
         for p in prop.get("people", []):
             nm = p.get("name") or (p.get("person") or {}).get("email") or ""
             if nm: names.append(nm)
         return ", ".join(names)
+
     if t == "rich_text":
         return "".join(rt.get("plain_text","") for rt in prop.get("rich_text", [])).strip()
+
     if t == "title":
-        return "".join(rt.get("plain_text","") for rt in p.get("title", [])).strip()
+        return "".join(rt.get("plain_text","") for rt in prop.get("title", [])).strip()
+
     if t == "select":
         sel = prop.get("select")
         return (sel or {}).get("name") or ""
+
     if t == "status":
         st = prop.get("status") or {}
         return (st.get("name") or "").strip()
+
+    # NEW: handle Notion formula
+    if t == "formula":
+        f = prop.get("formula") or {}
+        ftype = f.get("type")
+        if ftype == "string":
+            return (f.get("string") or "").strip()
+        if ftype == "number":
+            n = f.get("number")
+            return "" if n is None else str(n)
+        if ftype == "boolean":
+            return "true" if f.get("boolean") else "false"
+        if ftype == "date":
+            d = (f.get("date") or {}).get("start")
+            return d or ""
+        if ftype == "rich_text":
+            return "".join(rt.get("plain_text","") for rt in f.get("rich_text", [])).strip()
+        return ""
+
+    # NEW: handle Notion rollup
+    if t == "rollup":
+        r = prop.get("rollup") or {}
+        rtype = r.get("type")
+        if rtype == "array":
+            vals = []
+            for it in r.get("array", []):
+                it_type = it.get("type")
+                if it_type == "status":
+                    nm = ((it.get("status") or {}).get("name") or "").strip()
+                    if nm: vals.append(nm)
+                elif it_type == "select":
+                    nm = ((it.get("select") or {}).get("name") or "").strip()
+                    if nm: vals.append(nm)
+                elif it_type in ("title","rich_text"):
+                    vals.append(norm_people_or_text(it))
+                elif it_type == "people":
+                    vals.append(norm_people_or_text(it))
+            # return first non-empty (most rollups to status are singletons)
+            return ", ".join(v for v in vals if v).strip()
+        if rtype == "number":
+            n = r.get("number")
+            return "" if n is None else str(n)
+        if rtype == "date":
+            d = (r.get("date") or {}).get("start")
+            return d or ""
+        if rtype == "rich_text":
+            return "".join(rt.get("plain_text","") for rt in r.get("rich_text", [])).strip()
+        return ""
+
     # relations are handled elsewhere
     return ""
 
 def norm_status(prop: Dict[str, Any]) -> str:
     if not prop: return ""
     t = prop.get("type")
+
     if t == "status":
         st = prop.get("status") or {}
         return (st.get("name") or "").strip()
+
     if t == "select":
         sel = prop.get("select") or {}
         return (sel.get("name") or "").strip()
+
+    # handle formula / rollup that may yield a status/select/rich_text/string
+    if t in ("formula", "rollup", "rich_text", "title", "people"):
+        return norm_people_or_text(prop).strip()
+
+    # last resort
     return norm_people_or_text(prop).strip()
 
 def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
@@ -639,9 +701,16 @@ class SyncRunner:
                             ["Related Jira Assignee","Assignee","Assignee (Jira)","Assigned To","Owner","Handler","Assignee Name"]
                         )
 
-                        src_status_prop = prop_first(props, [
-                            "Status","Status (Jira)","Issue Status","State","Status name","Status Name","Jira Status","Current status","Workflow State"
+                        # Prefer exact field first; then fall back to fuzzy list
+                        src_status_prop = props.get("Status") or prop_first(props, [
+                            "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
+                            "Jira Status","Current status","Workflow State"
                         ])
+                        
+                        if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
+                            t = (src_status_prop or {}).get("type") if isinstance(src_status_prop, dict) else type(src_status_prop).__name__
+                            print(f"DEBUG_STATUS src_key={key} src_status_type={t} "
+                                  f"raw='{norm_status(src_status_prop)}'")
 
                         mapped = {
                             "Key": key,
