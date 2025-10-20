@@ -437,26 +437,22 @@ class SyncRunner:
         raw_status = (mapped.get("Status") or "").strip()
         status_payload = None
     
-        # We expect these to be populated once in run(): self.consolidated_status_type, self.consolidated_status_options
         ctype = getattr(self, "consolidated_status_type", None)
         coptions = getattr(self, "consolidated_status_options", [])
     
         if raw_status:
             if ctype == "select":
-                # Ensure option exists then use select payload
                 ensured = ensure_select_option(self.notion, self.consolidated_db, "Status", raw_status)
                 status_payload = {"select": {"name": ensured}}
             elif ctype == "status":
-                # Must map to an existing Status option; cannot create via API
                 mapped_opt = _map_status_to_existing(raw_status, coptions)
                 if mapped_opt:
                     status_payload = {"status": {"name": mapped_opt}}
                 else:
-                    # No safe mapping -> do not touch Status (avoid blanking/validation errors)
                     print(f"INFO: Skipping Status set for '{mapped.get('Key','?')}' "
                           f"because '{raw_status}' not found in consolidated options.")
             else:
-                # Fallback: if unknown schema, try a safe select (won't hurt if property is select)
+                # Unknown schema: try select as a safe fallback
                 status_payload = {"select": {"name": raw_status}}
     
         # Build props (omit Status for now; add only if we have a valid payload)
@@ -484,39 +480,73 @@ class SyncRunner:
         if status_payload:
             props["Status"] = status_payload
     
+        # Helper: read current Status name from a page
+        def _current_status_name(page: Dict[str, Any]) -> str:
+            p = (page.get("properties", {}) or {}).get("Status")
+            if not isinstance(p, dict):
+                return ""
+            t = p.get("type")
+            if t == "status":
+                st = p.get("status") or {}
+                return (st.get("name") or "").strip()
+            if t == "select":
+                sel = p.get("select") or {}
+                return (sel.get("name") or "").strip()
+            return ""
+    
+        # Derive desired status name (for comparison)
+        desired_status_name = ""
+        if status_payload:
+            if "status" in status_payload:
+                desired_status_name = (status_payload["status"].get("name") or "").strip()
+            elif "select" in status_payload:
+                desired_status_name = (status_payload["select"].get("name") or "").strip()
+    
         current = self.consolidated_find_by_key(mapped["Key"])
         if current is None:
+            # Create new page
             self.notion.page_create(self.consolidated_db, props)
             self.stats["created"] += 1
         else:
+            # Compare against existing
             cur_hash = ""
             try:
                 prop = current.get("properties", {}).get("Source Hash", {})
                 cur_hash = "".join(t.get("plain_text","") for t in prop.get("rich_text", []))
             except Exception:
                 cur_hash = ""
-            if os.getenv("FORCE_UPDATE_ALL", "") == "1":
+    
+            # Read current consolidated Status
+            current_status_name = _current_status_name(current)
+    
+            # Decide if we must update:
+            must_update = os.getenv("FORCE_UPDATE_ALL", "") == "1"
+            if not must_update:
+                # If the hash hasn't changed but Status differs (and we have a desired status), update anyway
+                if cur_hash == src_hash:
+                    if desired_status_name and (desired_status_name != current_status_name):
+                        must_update = True
+    
+            if must_update or cur_hash != src_hash:
                 self.notion.page_update(current["id"], props)
                 self.stats["updated"] += 1
-            elif cur_hash == src_hash:
-                self.stats["skipped"] += 1
             else:
-                self.notion.page_update(current["id"], props)
-                self.stats["updated"] += 1
+                self.stats["skipped"] += 1
+
 
     def _should_full_scan(self) -> bool:
         if os.getenv("FORCE_FULL_SCAN"):
             return True
         return dt.datetime.utcnow().weekday() == int(os.getenv("FULL_SCAN_WEEKDAY", "6"))
 
-    # --- Main run ---
+    # --- Main run --- #
 
     def run(self):
         control_row_id, watermark = self._get_control_row_id_and_value()
         if self._should_full_scan():
             watermark = None
-
-            # Detect Consolidated.Status schema once
+    
+        # Detect Consolidated.Status schema once (ALWAYS run this, not only on full scans)
         self.consolidated_status_type, self.consolidated_status_options = _fetch_consolidated_status_spec(
             self.notion, self.consolidated_db
         )
@@ -525,13 +555,13 @@ class SyncRunner:
                   f"({len(self.consolidated_status_options)} options)")
         else:
             print("WARNING: Could not determine Consolidated.Status property type")
-
+    
         for src_db in self.source_db_ids:
             next_cursor = None
             while True:
                 if self.stats["fetched"] >= self.max_pages:
                     break
-
+    
                 payload: Dict[str, Any] = {
                     "page_size": self.page_size,
                     "sorts": [
@@ -539,35 +569,35 @@ class SyncRunner:
                         {"timestamp": "last_edited_time", "direction": "descending"},
                     ],
                 }
-
+    
                 if watermark:
                     payload["filter"] = {
                         "property": "Updated",
                         "date": {"on_or_after": watermark}
                     }
-
+    
                 if next_cursor:
                     payload["start_cursor"] = next_cursor
-
+    
                 data = self.notion.db_query(src_db, payload)
                 results = data.get("results", [])
                 next_cursor = data.get("next_cursor")
                 has_more = data.get("has_more", False)
-
+    
                 for r in results:
                     self.stats["fetched"] += 1
                     try:
                         props = r.get("properties", {})
                         last_edited = r.get("last_edited_time")
-
+    
                         # print a few rows for field discovery
                         if self.stats["fetched"] <= 3 and os.getenv("DEBUG", "") == "1":
                             _debug_prop_names(props, key_label=f"{src_db}:{self.stats['fetched']}")
-
+    
                         key = norm_key(norm_people_or_text(props.get("Key")))
                         if not key:
                             continue
-
+    
                         reporter_val = self._extract_person_like(
                             props,
                             ["Related Jira Reporter","Reporter","Reporter (Jira)","Reported By","Creator","Author","Reporter Name"]
@@ -576,7 +606,7 @@ class SyncRunner:
                             props,
                             ["Related Jira Assignee","Assignee","Assignee (Jira)","Assigned To","Owner","Handler","Assignee Name"]
                         )
-
+    
                         mapped = {
                             "Key": key,
                             "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
@@ -600,26 +630,26 @@ class SyncRunner:
                             "Due date": norm_date_prop(prop_first(props, ["Due Date","Due date","Due"]))[0],
                             "Story Points": norm_number(prop_first(props, ["Story Points","Points","SP"])),
                         }
-
+    
                         if mapped["Updated"]:
                             if self.new_watermark is None or mapped["Updated"] > self.new_watermark:
                                 self.new_watermark = mapped["Updated"]
-
+    
                         self.consolidated_upsert(mapped, src_db)
-
+    
                         if (self.stats["created"] + self.stats["updated"]) % self.batch_size == 0:
                             time.sleep(self.sleep_secs)
-
+    
                     except Exception as e:
                         self.stats["errors"] += 1
                         print(f"ERROR key={props.get('Key') if 'props' in locals() else '?'} reason={e}")
-
+    
                 if not has_more:
                     break
-
+    
         if self.new_watermark and control_row_id:
             self._set_control_value(control_row_id, self.new_watermark)
-
+    
         print(json.dumps({
             "fetched": self.stats["fetched"],
             "created": self.stats["created"],
@@ -628,6 +658,7 @@ class SyncRunner:
             "errors": self.stats["errors"],
             "new_watermark": self.new_watermark,
         }, indent=2))
+
 
 # ---------- Entry Point ----------
 
