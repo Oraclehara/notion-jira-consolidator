@@ -103,7 +103,7 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
         st = prop.get("status") or {}
         return (st.get("name") or "").strip()
 
-    # NEW: handle Notion formula
+    # handle Notion formula
     if t == "formula":
         f = prop.get("formula") or {}
         ftype = f.get("type")
@@ -121,7 +121,7 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
             return "".join(rt.get("plain_text","") for rt in f.get("rich_text", [])).strip()
         return ""
 
-    # NEW: handle Notion rollup
+    # handle Notion rollup
     if t == "rollup":
         r = prop.get("rollup") or {}
         rtype = r.get("type")
@@ -135,11 +135,8 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
                 elif it_type == "select":
                     nm = ((it.get("select") or {}).get("name") or "").strip()
                     if nm: vals.append(nm)
-                elif it_type in ("title","rich_text"):
+                elif it_type in ("title","rich_text","people"):
                     vals.append(norm_people_or_text(it))
-                elif it_type == "people":
-                    vals.append(norm_people_or_text(it))
-            # return first non-empty (most rollups to status are singletons)
             return ", ".join(v for v in vals if v).strip()
         if rtype == "number":
             n = r.get("number")
@@ -166,7 +163,7 @@ def norm_status(prop: Dict[str, Any]) -> str:
         sel = prop.get("select") or {}
         return (sel.get("name") or "").strip()
 
-    # handle formula / rollup that may yield a status/select/rich_text/string
+    # handle formula / rollup / rich_text / title / people
     if t in ("formula", "rollup", "rich_text", "title", "people"):
         return norm_people_or_text(prop).strip()
 
@@ -743,7 +740,6 @@ class SyncRunner:
         # 4) normal direct cases: status/select/rich_text/title
         return norm_status(src_status_prop)
 
-
     # --- Main run ---
 
     def run(self):
@@ -811,9 +807,9 @@ class SyncRunner:
                             ["Related Jira Assignee","Assignee","Assignee (Jira)","Assigned To","Owner","Handler","Assignee Name"]
                         )
 
-                        # Prefer exact field first; then fall back to fuzzy list
+                        # Resolve status value (supports relation/rollup/formula/etc.)
                         status_val = self._extract_status_value(props)
-                        
+
                         if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
                             st_prop = props.get("Status") or prop_first(props, [
                                 "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
@@ -826,7 +822,8 @@ class SyncRunner:
                             "Key": key,
                             "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
                             "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
-                            "Status": enum_safe("Status", norm_status(src_status_prop)),
+                            # IMPORTANT: use the resolved value rather than an undefined variable
+                            "Status": enum_safe("Status", status_val),
                             "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
                             "Reporter": reporter_val,
                             "Assignee": assignee_val,
@@ -843,8 +840,7 @@ class SyncRunner:
                         }
 
                         if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
-                            print(f"DEBUG_STATUS src_key={key} src_status='{norm_status(src_status_prop)}' "
-                                  f"mapped='{mapped['Status']}'")
+                            print(f"DEBUG_STATUS src_key={key} final_mapped_status='{mapped['Status']}'")
 
                         if mapped["Updated"]:
                             if self.new_watermark is None or mapped["Updated"] > self.new_watermark:
