@@ -48,6 +48,7 @@ jobs:
           # NEW: force updates & show debug
           FORCE_UPDATE_ALL: '1'           # <— REMOVE after this test run
           DEBUG: '1'                      # <— REMOVE after we confirm names
+          DEBUG_STATUS: '1'
 #        env:
 #          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
 #          CONSOLIDATED_DB_ID: ${{ secrets.CONSOLIDATED_DB_ID }}
