@@ -246,46 +246,54 @@ def _fetch_consolidated_status_spec(notion: Notion, db_id: str) -> Tuple[str, Li
         print(f"WARNING: failed to read Consolidated.Status schema: {e}")
         return "", []
 
-def _map_status_to_existing(name: str, existing: List[str]) -> Optional[str]:
-    """
-    Try to map an incoming Jira status to one of the existing Notion status options.
-    - Case-insensitive exact match first.
-    - Then alias table.
-    - Otherwise return None (caller will skip setting to avoid 400s / blanks).
-    """
-    if not name:
+def _map_status_to_existing(status_name: str, options: List[str]) -> Optional[str]:
+    """Map an incoming Jira status to one of the existing Notion options."""
+    if not status_name or not options:
         return None
-    name_norm = _safe_lower(name)
-    # 1) exact case-insensitive match
-    for opt in existing:
-        if _safe_lower(opt) == name_norm:
-            return opt
 
-    # 2) alias table (adjust freely)
-    ALIASES = {
-        "to do": ["todo", "to-do", "to_do"],
-        "in progress": ["doing", "wip"],
-        "ready for testing": ["qa ready", "ready for qa", "ready-for-testing"],
-        "in review": ["code review", "review"],
-        "blocked": ["on hold", "blocked"],
-        "done": ["completed", "resolved", "closed"],
-        "not started": ["backlog", "new"],
+    s = status_name.strip()
+    opts_lower = [o.lower() for o in options]
+
+    # 1) Exact, case-insensitive
+    if s.lower() in opts_lower:
+        return options[opts_lower.index(s.lower())]
+
+    # 2) Normalize punctuation/spaces
+    def norm(x: str) -> str:
+        return x.replace("-", " ").replace("_", " ").replace(".", " ").strip().lower()
+
+    s_norm = norm(s)
+    for i, o in enumerate(options):
+        if norm(o) == s_norm:
+            return options[i]
+
+    # 3) Contains / contained-by heuristics
+    for i, o in enumerate(options):
+        if s_norm in o.lower() or o.lower() in s_norm:
+            return options[i]
+
+    # 4) Common Jira→Notion buckets
+    aliases = {
+        "to do": ["TO DO", "To do", "To Do", "todo", "to-do", "open", "backlog", "new"],
+        "in progress": ["in-progress", "doing", "started", "implementation", "wip"],
+        "in review": ["review", "code review", "peer review", "pr review"],
+        "ready for testing": ["qa", "ready for qa", "testing", "in qa", "qa ready"],
+        "blocked": ["on hold", "waiting"],
+        "done": ["closed", "resolved", "complete", "completed", "fixed", "merged"],
     }
-    for canonical, variants in ALIASES.items():
-        if name_norm == canonical or name_norm in variants:
-            # pick the first existing option that equals canonical or variant
-            for opt in existing:
-                if _safe_lower(opt) in ([canonical] + variants):
-                    return opt
+    for target, syns in aliases.items():
+        if s_norm == target or s_norm in syns:
+            # Prefer exact target if present
+            for i, o in enumerate(options):
+                if o.lower() == target:
+                    return options[i]
+            # Otherwise any option containing the target phrase
+            for i, o in enumerate(options):
+                if target in o.lower():
+                    return options[i]
 
-    # 3) sloppy fallback: first option that shares words (kept conservative)
-    parts = set(name_norm.split())
-    best = None
-    for opt in existing:
-        if parts & set(_safe_lower(opt).split()):
-            best = opt
-            break
-    return best  # might still be None
+    return None
+
 
 # ---------- Dynamic Status Option Helper ----------
 
