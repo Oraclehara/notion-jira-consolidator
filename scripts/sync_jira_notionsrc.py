@@ -635,49 +635,113 @@ class SyncRunner:
         return dt.datetime.utcnow().weekday() == int(os.getenv("FULL_SCAN_WEEKDAY", "6"))
 
     def _extract_status_value(self, props: Dict[str, Any]) -> str:
-    """
-    Resolve a status value from a variety of source shapes:
-    - direct status/select/rich_text/etc
-    - relation → fetch related page → read its Status (or common variants)
-    Returns a plain string (possibly empty).
-    """
-    # 1) Prefer exact field then fallback to fuzzy
-    src_status_prop = props.get("Status") or prop_first(props, [
-        "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
-        "Jira Status","Current status","Workflow State"
-    ])
-    if not src_status_prop:
-        return ""
+        """
+        Resolve a display-ready status from many shapes:
+        - direct: status/select/rich_text/title
+        - relation: fetch related page → try its Status/select → fallback to related page TITLE
+        - rollup: unpack array → handle select/status/relation items → fallback to strings
+        - formula: string
+        Returns a plain string (possibly empty).
+        """
+        # 0) find the most likely "Status" property on this row
+        src_status_prop = props.get("Status") or prop_first(props, [
+            "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
+            "Jira Status","Current status","Workflow State"
+        ])
+        if not src_status_prop:
+            return ""
 
-    t = src_status_prop.get("type")
-    # 2) If the source status is a relation, dereference it
-    if t == "relation":
-        rel = (src_status_prop.get("relation") or [])
-        for it in rel:
-            pid = it.get("id")
-            if not pid:
-                continue
-            try:
-                pg = self.notion.page_retrieve(pid)
-                p2 = (pg or {}).get("properties", {}) or {}
-                # Try the most likely property names on the related page
-                related_status_prop = p2.get("Status") or prop_first(p2, [
-                    "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
-                    "Jira Status","Current status","Workflow State"
-                ])
-                val = norm_status(related_status_prop)
-                if os.getenv("DEBUG_STATUS", "") == "1":
-                    print(f"DEBUG_STATUS relation→page {pid} resolved_status='{val}'")
-                if val:
-                    return val
-            except Exception as e:
-                if os.getenv("DEBUG_STATUS", "") == "1":
-                    print(f"DEBUG_STATUS relation deref failed for {pid}: {e}")
-        # If nothing resolved from the related pages, return empty
-        return ""
+        t = src_status_prop.get("type")
 
-    # 3) Not a relation → just normalize directly
-    return norm_status(src_status_prop)
+        # 1) relation → deref first related page and read its displayed name
+        if t == "relation":
+            rel = (src_status_prop.get("relation") or [])
+            for it in rel:
+                pid = it.get("id")
+                if not pid:
+                    continue
+                try:
+                    pg = self.notion.page_retrieve(pid)
+                    p2 = (pg or {}).get("properties", {}) or {}
+
+                    # prefer a proper status/select on the related page
+                    rp = p2.get("Status") or prop_first(p2, [
+                        "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
+                        "Jira Status","Current status","Workflow State"
+                    ])
+                    val = norm_status(rp)
+                    if val:
+                        if os.getenv("DEBUG_STATUS","")=="1":
+                            print(f"DEBUG_STATUS relation→page {pid} status_prop='{val}'")
+                        return val
+
+                    # otherwise: the related page title is exactly what the table shows
+                    title_txt = self._page_title_text(pg)
+                    if title_txt:
+                        if os.getenv("DEBUG_STATUS","")=="1":
+                            print(f"DEBUG_STATUS relation→page {pid} title_fallback='{title_txt}'")
+                        return title_txt
+                except Exception as e:
+                    if os.getenv("DEBUG_STATUS","")=="1":
+                        print(f"DEBUG_STATUS relation deref fail {pid}: {e}")
+            return ""
+
+        # 2) rollup → unpack what’s inside
+        if t == "rollup":
+            rl = src_status_prop.get("rollup") or {}
+            rtype = rl.get("type")
+            if rtype == "array":
+                arr = rl.get("array") or []
+                for item in arr:
+                    if not isinstance(item, dict):
+                        continue
+                    itype = item.get("type")
+                    if itype in ("select","status","rich_text","title"):
+                        val = norm_status(item) if itype in ("status","select") else norm_people_or_text(item)
+                        if val:
+                            if os.getenv("DEBUG_STATUS","")=="1":
+                                print(f"DEBUG_STATUS rollup array -> '{val}'")
+                            return val
+                    elif itype == "relation":
+                        rel2 = (item.get("relation") or [])
+                        for rel_it in rel2:
+                            pid = rel_it.get("id")
+                            if not pid:
+                                continue
+                            try:
+                                pg = self.notion.page_retrieve(pid)
+                                p2 = (pg or {}).get("properties", {}) or {}
+                                rp = p2.get("Status") or prop_first(p2, [
+                                    "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
+                                    "Jira Status","Current status","Workflow State"
+                                ])
+                                val = norm_status(rp) or self._page_title_text(pg)
+                                if val:
+                                    if os.getenv("DEBUG_STATUS","")=="1":
+                                        print(f"DEBUG_STATUS rollup relation→page {pid} '{val}'")
+                                    return val
+                            except Exception as e:
+                                if os.getenv("DEBUG_STATUS","")=="1":
+                                    print(f"DEBUG_STATUS rollup relation deref fail {pid}: {e}")
+            elif rtype == "string":
+                s = rl.get("string") or ""
+                if s.strip():
+                    return s.strip()
+            elif rtype == "number":
+                n = rl.get("number")
+                if n is not None:
+                    return str(n)
+            return ""
+
+        # 3) formula → string
+        if t == "formula":
+            f = src_status_prop.get("formula") or {}
+            if f.get("type") == "string":
+                return (f.get("string") or "").strip()
+            return ""
+
+        # 4) normal direct cases: status/select/rich_text/title
+        return norm_status(src_status_prop)
 
 
     # --- Main run ---
