@@ -63,6 +63,8 @@ jobs:
           BATCH_SIZE: '10'
           SLEEP_SECS: '0.4'
 
+          CHECKPOINT_EVERY_PAGE: '1'   # ← add this
+
           PYTHONUNBUFFERED: '1'
         run: |
           ( while true; do echo "heartbeat $(date -u +%H:%M:%S)"; sleep 60; done ) &
@@ -88,6 +90,8 @@ jobs:
           PAGE_SIZE: '100'
           BATCH_SIZE: '10'
           SLEEP_SECS: '0.4'
+
+          CHECKPOINT_EVERY_PAGE: '1'   # ← add this
 
           PYTHONUNBUFFERED: '1'
         run: |
