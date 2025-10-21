@@ -8,6 +8,10 @@ import requests
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
 NOTION_API = "https://api.notion.com/v1"
 SESSION = requests.Session()
+COMMON_STATUS_OPTIONS = [
+    "TO DO", "In Progress", "Done", "Closed", "Open",
+    "Ready for Testing", "In Review", "Blocked", "In Analysis", "Completed"
+]
 
 # ---------- Notion API Wrapper ----------
 
@@ -356,31 +360,81 @@ def _map_status_to_existing(name: str, existing: List[str]) -> Optional[str]:
 # ---------- Dynamic Status Option Helper ----------
 
 def ensure_select_option(notion: Notion, db_id: str, property_name: str, option_name: str):
-    """Ensure a Notion select property has the given option, create it if missing."""
+    """Ensure a Notion select property has the given option, create it if missing, and wait until it appears."""
     if not option_name:
         return option_name
     try:
-        db = notion._req("GET", f"/databases/{db_id}")
-        props = db.get("properties", {})
-        prop = props.get(property_name, {})
-        if not prop:
-            return option_name
-        if prop.get("type") == "select":
-            existing = [o["name"] for o in prop["select"].get("options", [])]
-            if option_name not in existing:
-                notion._req("PATCH", f"/databases/{db_id}", json={
-                    "properties": {
-                        property_name: {
-                            "select": {
-                                "options": [{"name": option_name}]
-                            }
+        def _get_options():
+            db = notion._req("GET", f"/databases/{db_id}")
+            props = db.get("properties", {}) or {}
+            prop = props.get(property_name, {}) or {}
+            if prop.get("type") != "select":
+                return []
+            return [o.get("name") for o in (prop.get("select") or {}).get("options", []) if o and o.get("name")]
+
+        existing = set(_get_options())
+        if option_name not in existing:
+            notion._req("PATCH", f"/databases/{db_id}", json={
+                "properties": {
+                    property_name: {
+                        "select": {
+                            "options": [{"name": option_name}]
                         }
                     }
-                })
-                print(f"INFO: Added new select option '{option_name}' to '{property_name}'")
+                }
+            })
+            print(f"INFO: Added new select option '{option_name}' to '{property_name}'")
+
+        # Poll (short) until it shows up (handles Notion eventual consistency)
+        backoff = 0.25
+        for _ in range(8):  # ~ couple of seconds total
+            existing = set(_get_options())
+            if option_name in existing:
+                return option_name
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 1.0)
+
+        # Last resort: return anyway (page update may still work later)
+        return option_name
+
     except Exception as e:
         print(f"WARNING: Failed to ensure option '{option_name}' for '{property_name}': {e}")
-    return option_name
+        return option_name
+
+def seed_common_status_options(notion: Notion, db_id: str, property_name: str, required: List[str]):
+    """Ensure a baseline set of select options exists up-front to avoid per-row races."""
+    try:
+        db = notion._req("GET", f"/databases/{db_id}")
+        props = (db.get("properties") or {})
+        prop = props.get(property_name, {})
+        if prop.get("type") != "select":
+            return
+        current = {o.get("name") for o in (prop.get("select") or {}).get("options", []) if o and o.get("name")}
+        missing = [name for name in required if name not in current]
+        if not missing:
+            return
+        notion._req("PATCH", f"/databases/{db_id}", json={
+            "properties": {
+                property_name: {
+                    "select": {
+                        "options": [{"name": name} for name in missing]
+                    }
+                }
+            }
+        })
+        print(f"INFO: Seeded {len(missing)} Status options: {', '.join(missing)}")
+
+        # Light poll until all appear
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            db2 = notion._req("GET", f"/databases/{db_id}")
+            prop2 = (db2.get("properties") or {}).get(property_name, {})
+            now = {o.get("name") for o in (prop2.get("select") or {}).get("options", []) if o and o.get("name")}
+            if all(x in now for x in required):
+                break
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"WARNING: Could not seed Status options: {e}")
 
 def _is_validation_error(e: Exception) -> bool:
     s = str(e)
@@ -532,8 +586,8 @@ class SyncRunner:
         """
         Attempts to create/update the page, trying Status payload candidates in order.
         If a 400 validation error occurs, it retries with the next candidate.
+        For select validation (option not found), we retry once after a short wait.
         """
-        # no Status field at all
         if not status_payload_candidates:
             if current is None:
                 self.notion.page_create(self.consolidated_db, base_props)
@@ -542,29 +596,36 @@ class SyncRunner:
                 self.notion.page_update(current["id"], base_props)
                 self.stats["updated"] += 1
             return
-
-        # Try candidates in order
+    
         last_err = None
-        for cand in status_payload_candidates:
+        for idx, cand in enumerate(status_payload_candidates):
             props = dict(base_props)
             props["Status"] = cand
-            try:
-                if current is None:
-                    self.notion.page_create(self.consolidated_db, props)
-                    self.stats["created"] += 1
-                else:
-                    self.notion.page_update(current["id"], props)
-                    self.stats["updated"] += 1
-                return
-            except Exception as e:
-                last_err = e
-                if _is_validation_error(e):
-                    # try next candidate
-                    continue
-                # Non-validation error -> re-raise
-                raise
-
-        # If we exhausted candidates due to validation errors, log and proceed without Status
+            tried_retry = False
+            while True:
+                try:
+                    if current is None:
+                        self.notion.page_create(self.consolidated_db, props)
+                        self.stats["created"] += 1
+                    else:
+                        self.notion.page_update(current["id"], props)
+                        self.stats["updated"] += 1
+                    return
+                except Exception as e:
+                    last_err = e
+                    s = str(e)
+                    # If it's clearly a select validation issue, wait once and retry this same candidate
+                    if (("validation_error" in s or "Invalid" in s or "property type" in s)
+                        and not tried_retry
+                        and "select" in cand):
+                        time.sleep(0.5)  # brief yield for schema to propagate
+                        tried_retry = True
+                        continue
+                    # Otherwise move to next candidate (or bail if none left)
+                    if _is_validation_error(e):
+                        break
+                    raise
+    
         print(f"INFO: All Status payload variants failed validation; saving without Status. reason={last_err}")
         if current is None:
             self.notion.page_create(self.consolidated_db, base_props)
@@ -572,9 +633,6 @@ class SyncRunner:
         else:
             self.notion.page_update(current["id"], base_props)
             self.stats["updated"] += 1
-
-    # --- Upsert with robust Status handling ---
-
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
         raw_status = (mapped.get("Status") or "").strip()
 
@@ -756,6 +814,14 @@ class SyncRunner:
                   f"({len(self.consolidated_status_options)} options)")
         else:
             print("WARNING: Could not determine Consolidated.Status property type")
+
+        # If it's a select with very few options, seed the usual set once to avoid per-row races.
+        if self.consolidated_status_type == "select":
+            seed_common_status_options(self.notion, self.consolidated_db, "Status", COMMON_STATUS_OPTIONS)
+            # Refresh local cache of options after seeding
+            self.consolidated_status_type, self.consolidated_status_options = _fetch_consolidated_status_spec(
+                self.notion, self.consolidated_db
+            )
 
         for src_db in self.source_db_ids:
             next_cursor = None
