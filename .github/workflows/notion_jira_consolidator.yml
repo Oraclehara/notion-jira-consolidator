@@ -16,6 +16,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    environment: prod-secrets    # ← attach the job to your Environment
 
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +32,19 @@ jobs:
         run: |
           test -f scripts/sync_jira_notionsrc.py
           chmod +x scripts/sync_jira_notionsrc.py
+
+      # (Optional) quick sanity check so you never chase empty secrets again
+      - name: Debug environment vars
+        run: |
+          echo "Checking secret availability"
+          for v in NOTION_TOKEN CONSOLIDATED_DB_ID SYNC_CONTROL_PAGE_ID SOURCE_DB_IDS; do
+            if [ -z "${!v}" ]; then echo "::error::$v is empty"; else echo "$v is set ✅"; fi
+          done
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          CONSOLIDATED_DB_ID: ${{ secrets.CONSOLIDATED_DB_ID }}
+          SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
+          SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
 
       # FULL backfill: only when you press "Run workflow"
       - name: FULL backfill (one-time)
