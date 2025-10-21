@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-# Notion-based Jira Consolidator (No Jira API) — relation-aware people resolution + robust Status write
+# Notion-based Jira Consolidator (No Jira API)
+# - Relation-aware people resolution
+# - Robust Status resolution (supports relation/rollup/formula)
+# - Stable writes to Consolidated.Status (select/status) with schema seeding & retries
 
 import os, sys, time, json, hashlib, datetime as dt
 from typing import Dict, Any, List, Optional, Tuple
@@ -8,6 +11,8 @@ import requests
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
 NOTION_API = "https://api.notion.com/v1"
 SESSION = requests.Session()
+
+# Seeded baseline select options to avoid eventual-consistency races
 COMMON_STATUS_OPTIONS = [
     "TO DO", "In Progress", "Done", "Closed", "Open",
     "Ready for Testing", "In Review", "Blocked", "In Analysis", "Completed"
@@ -107,7 +112,7 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
         st = prop.get("status") or {}
         return (st.get("name") or "").strip()
 
-    # handle Notion formula
+    # Formula support
     if t == "formula":
         f = prop.get("formula") or {}
         ftype = f.get("type")
@@ -125,12 +130,12 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
             return "".join(rt.get("plain_text","") for rt in f.get("rich_text", [])).strip()
         return ""
 
-    # handle Notion rollup
+    # Rollup support
     if t == "rollup":
         r = prop.get("rollup") or {}
         rtype = r.get("type")
         if rtype == "array":
-            vals = []
+            vals: List[str] = []
             for it in r.get("array", []):
                 it_type = it.get("type")
                 if it_type == "status":
@@ -140,7 +145,8 @@ def norm_people_or_text(prop: Dict[str, Any]) -> str:
                     nm = ((it.get("select") or {}).get("name") or "").strip()
                     if nm: vals.append(nm)
                 elif it_type in ("title","rich_text","people"):
-                    vals.append(norm_people_or_text(it))
+                    txt = norm_people_or_text(it)
+                    if txt: vals.append(txt)
             return ", ".join(v for v in vals if v).strip()
         if rtype == "number":
             n = r.get("number")
@@ -167,11 +173,9 @@ def norm_status(prop: Dict[str, Any]) -> str:
         sel = prop.get("select") or {}
         return (sel.get("name") or "").strip()
 
-    # handle formula / rollup / rich_text / title / people
     if t in ("formula", "rollup", "rich_text", "title", "people"):
         return norm_people_or_text(prop).strip()
 
-    # last resort
     return norm_people_or_text(prop).strip()
 
 def prop_first(props: Dict[str, Any], names: List[str]) -> Optional[Dict[str, Any]]:
@@ -344,6 +348,9 @@ def _map_status_to_existing(name: str, existing: List[str]) -> Optional[str]:
         "blocked": ["on hold", "on-hold"],
         "done": ["completed", "resolved", "closed"],
         "not started": ["backlog", "new"],
+        "completed": ["done"],
+        "open": [],
+        "closed": ["done", "resolved"],
     }
     for canonical, variants in ALIASES.items():
         if name_norm == canonical or name_norm in variants:
@@ -387,14 +394,14 @@ def ensure_select_option(notion: Notion, db_id: str, property_name: str, option_
 
         # Poll (short) until it shows up (handles Notion eventual consistency)
         backoff = 0.25
-        for _ in range(8):  # ~ couple of seconds total
+        for _ in range(8):
             existing = set(_get_options())
             if option_name in existing:
                 return option_name
             time.sleep(backoff)
             backoff = min(backoff * 1.5, 1.0)
 
-        # Last resort: return anyway (page update may still work later)
+        # Return anyway; caller may retry page update.
         return option_name
 
     except Exception as e:
@@ -424,7 +431,7 @@ def seed_common_status_options(notion: Notion, db_id: str, property_name: str, r
         })
         print(f"INFO: Seeded {len(missing)} Status options: {', '.join(missing)}")
 
-        # Light poll until all appear
+        # Light poll until all appear (up to ~5s)
         deadline = time.time() + 5.0
         while time.time() < deadline:
             db2 = notion._req("GET", f"/databases/{db_id}")
@@ -469,7 +476,6 @@ def _build_status_payloads(raw_status: str,
     elif consolidated_type == "status":
         candidates = [_status_payload(), _select_payload()]
     else:
-        # unknown: try both; Notion will reject the wrong shape and we'll fall back
         candidates = [_select_payload(), _status_payload()]
     return candidates
 
@@ -586,7 +592,7 @@ class SyncRunner:
         """
         Attempts to create/update the page, trying Status payload candidates in order.
         If a 400 validation error occurs, it retries with the next candidate.
-        For select validation (option not found), we retry once after a short wait.
+        For select validation (option not found), retry once after a short wait.
         """
         if not status_payload_candidates:
             if current is None:
@@ -596,9 +602,9 @@ class SyncRunner:
                 self.notion.page_update(current["id"], base_props)
                 self.stats["updated"] += 1
             return
-    
+
         last_err = None
-        for idx, cand in enumerate(status_payload_candidates):
+        for cand in status_payload_candidates:
             props = dict(base_props)
             props["Status"] = cand
             tried_retry = False
@@ -625,7 +631,7 @@ class SyncRunner:
                     if _is_validation_error(e):
                         break
                     raise
-    
+
         print(f"INFO: All Status payload variants failed validation; saving without Status. reason={last_err}")
         if current is None:
             self.notion.page_create(self.consolidated_db, base_props)
@@ -633,6 +639,9 @@ class SyncRunner:
         else:
             self.notion.page_update(current["id"], base_props)
             self.stats["updated"] += 1
+
+    # --- Upsert with robust Status handling ---
+
     def consolidated_upsert(self, mapped: Dict[str, Any], src_db_id: str) -> None:
         raw_status = (mapped.get("Status") or "").strip()
 
@@ -815,7 +824,7 @@ class SyncRunner:
         else:
             print("WARNING: Could not determine Consolidated.Status property type")
 
-        # If it's a select with very few options, seed the usual set once to avoid per-row races.
+        # If it's a select with few options, seed common ones to avoid per-row races
         if self.consolidated_status_type == "select":
             seed_common_status_options(self.notion, self.consolidated_db, "Status", COMMON_STATUS_OPTIONS)
             # Refresh local cache of options after seeding
@@ -873,9 +882,8 @@ class SyncRunner:
                             ["Related Jira Assignee","Assignee","Assignee (Jira)","Assigned To","Owner","Handler","Assignee Name"]
                         )
 
-                        # Resolve status value (supports relation/rollup/formula/etc.)
+                        # Resolve Status robustly from embedded Jira relation/rollup/etc.
                         status_val = self._extract_status_value(props)
-
                         if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
                             st_prop = props.get("Status") or prop_first(props, [
                                 "Status","Status (Jira)","Issue Status","State","Status name","Status Name",
@@ -883,12 +891,12 @@ class SyncRunner:
                             ])
                             st_type = (st_prop or {}).get("type") if isinstance(st_prop, dict) else type(st_prop).__name__
                             print(f"DEBUG_STATUS src_key={key} src_status_type={st_type} resolved='{status_val}'")
+                            print(f"DEBUG_STATUS src_key={key} final_mapped_status='{status_val}'")
 
                         mapped = {
                             "Key": key,
                             "Summary": norm_people_or_text(prop_first(props, ["Summary","Title","Issue summary","Name"])),
                             "Issue Type": enum_safe("Issue Type", norm_people_or_text(prop_first(props, ["Issue Type","Type","Issue type"]))),
-                            # IMPORTANT: use the resolved value rather than an undefined variable
                             "Status": enum_safe("Status", status_val),
                             "Priority": enum_safe("Priority", norm_people_or_text(prop_first(props, ["Priority","Issue Priority"]))),
                             "Reporter": reporter_val,
@@ -904,9 +912,6 @@ class SyncRunner:
                             "Due date": norm_date_prop(prop_first(props, ["Due Date","Due date","Due"]))[0],
                             "Story Points": norm_number(prop_first(props, ["Story Points","Points","SP"])),
                         }
-
-                        if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
-                            print(f"DEBUG_STATUS src_key={key} final_mapped_status='{mapped['Status']}'")
 
                         if mapped["Updated"]:
                             if self.new_watermark is None or mapped["Updated"] > self.new_watermark:
