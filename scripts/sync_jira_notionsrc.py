@@ -802,7 +802,13 @@ class SyncRunner:
         for src_db in self.source_db_ids:
             next_cursor = None
             while True:
+                # Budget guard with checkpoint
                 if self.stats["fetched"] >= self.max_pages:
+                    if control_row_id and self.new_watermark and os.getenv("CHECKPOINT_EVERY_PAGE", "1") == "1":
+                        try:
+                            self._set_control_value(control_row_id, self.new_watermark)
+                        except Exception as e:
+                            print(f"WARNING: checkpoint watermark failed: {e}")
                     break
 
                 payload: Dict[str, Any] = {
@@ -932,9 +938,19 @@ class SyncRunner:
                         self.stats["errors"] += 1
                         print(f"ERROR key={props.get('Key') if 'props' in locals() else '?'} reason={e}")
 
+                # ---------- CHECKPOINT AFTER EACH PAGE ----------
+                if control_row_id and self.new_watermark and os.getenv("CHECKPOINT_EVERY_PAGE", "1") == "1":
+                    try:
+                        self._set_control_value(control_row_id, self.new_watermark)
+                        # Uncomment for verbose logging
+                        # print(f"INFO checkpoint watermark => {self.new_watermark}")
+                    except Exception as e:
+                        print(f"WARNING: checkpoint watermark failed: {e}")
+
                 if not has_more:
                     break
 
+        # Final checkpoint (covers cases where per-page was disabled)
         if self.new_watermark and control_row_id:
             self._set_control_value(control_row_id, self.new_watermark)
 
