@@ -1,21 +1,54 @@
 name: Notion Jira Consolidator (Public-Hardened)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      full_run:
+        description: "Run a full backfill (ignore watermark) this time?"
+        required: false
+        default: "0"            # set to "1" when you want a full run
+        type: choice
+        options: ["0", "1"]
+      force_update_all:
+        description: "Force update every row even if Source Hash unchanged (debug only)"
+        required: false
+        default: "0"
+        type: choice
+        options: ["0", "1"]
+      debug:
+        description: "Enable DEBUG logs"
+        required: false
+        default: "0"
+        type: choice
+        options: ["0", "1"]
+      debug_status:
+        description: "Enable Status resolver traces"
+        required: false
+        default: "0"
+        type: choice
+        options: ["0", "1"]
+      max_pages:
+        description: "Cap pages this run (blank uses default)"
+        required: false
+        default: ""
+        type: string
+
   schedule:
-    - cron: "7 * * * *"   # hourly
+    - cron: "7 * * * *"   # hourly incremental
 
 permissions:
-  contents: read           # least privilege
+  contents: read
 
+# Cancel older in-progress runs so hourly jobs don't overlap
 concurrency:
   group: jira-notion-sync
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     environment: prod-secrets
+
     steps:
       - uses: actions/checkout@v4
 
@@ -31,35 +64,31 @@ jobs:
           test -f scripts/sync_jira_notionsrc.py
           chmod +x scripts/sync_jira_notionsrc.py
 
-      - name: Run incremental sync
+      - name: Run sync
         env:
+          # required
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           CONSOLIDATED_DB_ID: ${{ secrets.CONSOLIDATED_DB_ID }}
           SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
           SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
-        
-          # Make it a true full backfill this run
-          FORCE_FULL_SCAN: '1'
-          MAX_PAGES_PER_RUN: 200          # keep modest to see logs quickly
-          PAGE_SIZE: 100
-          BATCH_SIZE: 10
-          SLEEP_SECS: 0.4
-        
-          # NEW: force updates & show debug
-          FORCE_UPDATE_ALL: '1'           # <— REMOVE after this test run
-          DEBUG: '1'                      # <— REMOVE after we confirm names
-          DEBUG_STATUS: '1'
-#        env:
-#          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-#          CONSOLIDATED_DB_ID: ${{ secrets.CONSOLIDATED_DB_ID }}
-#          SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
-#          SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
-#         # MAX_PAGES_PER_RUN: ${{ vars.MAX_PAGES_PER_RUN || 50 }}
-#          MAX_PAGES_PER_RUN: 20
-#          PAGE_SIZE: ${{ vars.PAGE_SIZE || 100 }}
-#          BATCH_SIZE: ${{ vars.BATCH_SIZE || 10 }}
-#          SLEEP_SECS: ${{ vars.SLEEP_SECS || 0.4 }}
-#          FULL_SCAN_WEEKDAY: ${{ vars.FULL_SCAN_WEEKDAY || 6 }}
-#          FORCE_FULL_SCAN: '1'
-         # FORCE_FULL_SCAN: ${{ vars.FORCE_FULL_SCAN || '' }}
+
+          # behavior flags
+          # Full run ONLY when you dispatch with full_run=1; otherwise empty -> incremental
+          FORCE_FULL_SCAN: ${{ github.event_name == 'workflow_dispatch' && inputs.full_run == '1' && '1' || '' }}
+
+          # (optional) also allow a weekly auto full-run if you ever want it
+          # FULL_SCAN_WEEKDAY: "6"  # Sunday
+
+          # Tuning (safe defaults for hourly incremental)
+          PAGE_SIZE: "100"
+          BATCH_SIZE: "10"
+          SLEEP_SECS: "0.4"
+          MAX_PAGES_PER_RUN: ${{ inputs.max_pages != '' && inputs.max_pages || '2000' }}
+
+          # Debug toggles (off by default)
+          DEBUG: ${{ github.event_name == 'workflow_dispatch' && inputs.debug == '1' && '1' || '' }}
+          DEBUG_STATUS: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_status == '1' && '1' || '' }}
+
+          # Force updates (debug only; off by default)
+          FORCE_UPDATE_ALL: ${{ github.event_name == 'workflow_dispatch' && inputs.force_update_all == '1' && '1' || '' }}
         run: python scripts/sync_jira_notionsrc.py
