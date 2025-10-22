@@ -3,20 +3,20 @@ name: Notion Jira Consolidator (Full once, then Incremental)
 on:
   workflow_dispatch: {}      # manual button for a full backfill
   schedule:
-    - cron: "7 * * * *"      # hourly incrementals
+    - cron: "7 * * * *"      # hourly incrementals (UTC)
 
 permissions:
   contents: read
 
 concurrency:
   group: jira-notion-sync
-  cancel-in-progress: false
+  cancel-in-progress: true       # ← cancel older run when a new one starts
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    environment: prod-secrets    # ← attach the job to your Environment
+    timeout-minutes: 300         # ← give the full run room; incrementals will finish sooner anyway
+    environment: prod-secrets    # ← attaches secrets from this Environment
 
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +24,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"           # ← speed up "Install deps"
 
       - name: Install deps
         run: python -m pip install --upgrade pip requests
@@ -63,7 +64,7 @@ jobs:
           BATCH_SIZE: '10'
           SLEEP_SECS: '0.4'
 
-          CHECKPOINT_EVERY_PAGE: '1'   # ← add this
+          CHECKPOINT_EVERY_PAGE: '1'   # ← enables per-page watermark writes
 
           PYTHONUNBUFFERED: '1'
         run: |
@@ -86,12 +87,12 @@ jobs:
           FORCE_FULL_SCAN: ''
           FORCE_UPDATE_ALL: ''
 
-          MAX_PAGES_PER_RUN: '2000'
+          MAX_PAGES_PER_RUN: '800'     # ← smaller slices; reliable + resumable
           PAGE_SIZE: '100'
           BATCH_SIZE: '10'
           SLEEP_SECS: '0.4'
 
-          CHECKPOINT_EVERY_PAGE: '1'   # ← add this
+          CHECKPOINT_EVERY_PAGE: '1'   # ← keep for safe resume
 
           PYTHONUNBUFFERED: '1'
         run: |
