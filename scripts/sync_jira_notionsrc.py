@@ -520,23 +520,43 @@ class SyncRunner:
 
     # --- Control DB (watermark) ---
 
-    def _get_control_row_id_and_value(self) -> Tuple[Optional[str], Optional[str]]:
+    def _get_control_row_id_and_value(self) -> Tuple[Optional[str], Optional[str], int]:
         res = self.notion.db_query(self.sync_control_db, {"page_size": 1})
         rows = res.get("results", [])
         if not rows:
-            created = self.notion.page_create(self.sync_control_db, {"Name": title("Main Control")})
+            # Create the control row with both fields initialized
+            created = self.notion.page_create(
+                self.sync_control_db,
+                {
+                    "Name": title("Main Control"),
+                    "Last Watermark (Date)": date(None),
+                    "Last Source Index": {"number": 0},
+                },
+            )
             rows = [created]
+    
         row = rows[0]
-        props = row.get("properties", {})
+        props = row.get("properties", {}) or {}
+    
+        # Watermark
         lw = props.get("Last Watermark (Date)")
         iso_val = None
         if lw and lw.get("type") == "date" and lw.get("date"):
             iso_val = lw["date"].get("start")
-        return row["id"], iso_val
+    
+        # Source index (default 0 if missing)
+        lsi_prop = props.get("Last Source Index") or {}
+        start_idx = 0
+        if lsi_prop.get("type") == "number":
+            n = lsi_prop.get("number")
+            if isinstance(n, (int, float)) and n is not None:
+                start_idx = int(n) if n >= 0 else 0
+    
+        return row["id"], iso_val, start_idx
 
-    def _set_control_value(self, row_id: str, iso_str: Optional[str]):
-        self.notion.page_update(row_id, {"Last Watermark (Date)": date(iso_str)})
-
+    def _set_control_source_index(self, row_id: str, idx: int):
+        # Persist the index we want the next run to start from
+        self.notion.page_update(row_id, {"Last Source Index": {"number": idx}})
     # --- Consolidated DB lookup ---
 
     def consolidated_find_by_key(self, key: str) -> Optional[Dict[str, Any]]:
@@ -780,13 +800,15 @@ class SyncRunner:
         return dt.datetime.utcnow().weekday() == int(os.getenv("FULL_SCAN_WEEKDAY", "6"))
 
     def run(self):
-        control_row_id, watermark = self._get_control_row_id_and_value()
+        control_row_id, watermark, start_idx = self._get_control_row_id_and_value()
+    
+        # Determine whether to full scan; full scan ignores watermark (but still honors round-robin order)
         if self._should_full_scan():
             watermark = None
-
-        # Ensure Consolidated.Status has a healthy option set before we start
+    
+        # Ensure Consolidated.Status has healthy options before we start
         seed_status_options_if_needed(self.notion, self.consolidated_db)
-
+    
         # Detect schema (and cache options)
         self.consolidated_status_type, self.consolidated_status_options = _fetch_consolidated_status_spec(
             self.notion, self.consolidated_db
@@ -798,19 +820,27 @@ class SyncRunner:
             )
         else:
             print("WARNING: Could not determine Consolidated.Status property type")
-
-        for src_db in self.source_db_ids:
+    
+        # --- Round-robin rotation ---
+        total_sources = len(self.source_db_ids)
+        if total_sources == 0:
+            print("INFO: No source databases provided.")
+            return
+        if start_idx < 0 or start_idx >= total_sources:
+            start_idx = 0  # sanitize
+    
+        # We'll iterate sources in rotated order starting from start_idx
+        # and persist "next start" after each source finishes.
+        for offset in range(total_sources):
+            src_db = self.source_db_ids[(start_idx + offset) % total_sources]
+    
+            next_start = (start_idx + offset + 1) % total_sources  # where the *next run* should begin
+    
             next_cursor = None
             while True:
-                # Budget guard with checkpoint
                 if self.stats["fetched"] >= self.max_pages:
-                    if control_row_id and self.new_watermark and os.getenv("CHECKPOINT_EVERY_PAGE", "1") == "1":
-                        try:
-                            self._set_control_value(control_row_id, self.new_watermark)
-                        except Exception as e:
-                            print(f"WARNING: checkpoint watermark failed: {e}")
                     break
-
+    
                 payload: Dict[str, Any] = {
                     "page_size": self.page_size,
                     "sorts": [
@@ -818,31 +848,31 @@ class SyncRunner:
                         {"timestamp": "last_edited_time", "direction": "descending"},
                     ],
                 }
-
+    
                 if watermark:
                     payload["filter"] = {"property": "Updated", "date": {"on_or_after": watermark}}
-
+    
                 if next_cursor:
                     payload["start_cursor"] = next_cursor
-
+    
                 data = self.notion.db_query(src_db, payload)
                 results = data.get("results", [])
                 next_cursor = data.get("next_cursor")
                 has_more = data.get("has_more", False)
-
+    
                 for r in results:
                     self.stats["fetched"] += 1
                     try:
                         props = r.get("properties", {})
                         last_edited = r.get("last_edited_time")
-
+    
                         if self.stats["fetched"] <= 3 and os.getenv("DEBUG", "") == "1":
                             _debug_prop_names(props, key_label=f"{src_db}:{self.stats['fetched']}")
-
+    
                         key = norm_key(norm_people_or_text(props.get("Key")))
                         if not key:
                             continue
-
+    
                         reporter_val = self._extract_person_like(
                             props,
                             [
@@ -867,8 +897,7 @@ class SyncRunner:
                                 "Assignee Name",
                             ],
                         )
-
-                        # Resolve Status from many shapes
+    
                         status_val = self._extract_status_value(props)
                         if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
                             st_prop = props.get("Status") or prop_first(
@@ -889,7 +918,7 @@ class SyncRunner:
                             _dbg_status(
                                 f"DEBUG_STATUS src_key={key} src_status_type={st_type} resolved='{status_val}'"
                             )
-
+    
                         mapped = {
                             "Key": key,
                             "Summary": norm_people_or_text(
@@ -899,7 +928,6 @@ class SyncRunner:
                                 "Issue Type",
                                 norm_people_or_text(prop_first(props, ["Issue Type", "Type", "Issue type"])),
                             ),
-                            # IMPORTANT: use resolved value, not raw property
                             "Status": enum_safe("Status", status_val),
                             "Priority": enum_safe(
                                 "Priority", norm_people_or_text(prop_first(props, ["Priority", "Issue Priority"]))
@@ -921,39 +949,37 @@ class SyncRunner:
                             "Due date": norm_date_prop(prop_first(props, ["Due Date", "Due date", "Due"]))[0],
                             "Story Points": norm_number(prop_first(props, ["Story Points", "Points", "SP"])),
                         }
-
+    
                         if os.getenv("DEBUG_STATUS", "") == "1" and self.stats["fetched"] <= 10:
                             _dbg_status(f"DEBUG_STATUS src_key={key} final_mapped_status='{mapped['Status']}'")
-
+    
                         if mapped["Updated"]:
                             if self.new_watermark is None or mapped["Updated"] > self.new_watermark:
                                 self.new_watermark = mapped["Updated"]
-
+    
                         self.consolidated_upsert(mapped, src_db)
-
+    
                         if (self.stats["created"] + self.stats["updated"]) % self.batch_size == 0:
                             time.sleep(self.sleep_secs)
-
+    
                     except Exception as e:
                         self.stats["errors"] += 1
                         print(f"ERROR key={props.get('Key') if 'props' in locals() else '?'} reason={e}")
-
-                # ---------- CHECKPOINT AFTER EACH PAGE ----------
-                if control_row_id and self.new_watermark and os.getenv("CHECKPOINT_EVERY_PAGE", "1") == "1":
-                    try:
-                        self._set_control_value(control_row_id, self.new_watermark)
-                        # Uncomment for verbose logging
-                        # print(f"INFO checkpoint watermark => {self.new_watermark}")
-                    except Exception as e:
-                        print(f"WARNING: checkpoint watermark failed: {e}")
-
+    
                 if not has_more:
                     break
-
-        # Final checkpoint (covers cases where per-page was disabled)
+    
+            # We completed this source; advance the round-robin pointer for the *next run*
+            if control_row_id:
+                try:
+                    self._set_control_source_index(control_row_id, next_start)
+                except Exception as e:
+                    print(f"WARNING: failed to persist Last Source Index: {e}")
+    
+        # After all sources, commit watermark (if any)
         if self.new_watermark and control_row_id:
             self._set_control_value(control_row_id, self.new_watermark)
-
+    
         print(
             json.dumps(
                 {
