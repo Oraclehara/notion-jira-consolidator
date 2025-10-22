@@ -554,6 +554,10 @@ class SyncRunner:
     
         return row["id"], iso_val, start_idx
 
+    def _set_control_value(self, row_id: str, iso_str: Optional[str]):
+        """Update the Last Watermark (Date) in the control DB"""
+        self.notion.page_update(row_id, {"Last Watermark (Date)": date(iso_str)})
+
     def _set_control_source_index(self, row_id: str, idx: int):
         # Persist the index we want the next run to start from
         self.notion.page_update(row_id, {"Last Source Index": {"number": idx}})
