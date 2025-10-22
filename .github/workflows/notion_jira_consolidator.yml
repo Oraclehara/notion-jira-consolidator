@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: jira-notion-sync
-  cancel-in-progress: true       # ← cancel older run when a new one starts
+  cancel-in-progress: false       # ← cancel older run when a new one starts
 
 jobs:
   sync:
