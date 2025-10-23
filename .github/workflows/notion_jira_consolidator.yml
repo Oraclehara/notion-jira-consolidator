@@ -1,7 +1,22 @@
 name: Notion Jira Consolidator (Full once, then Incremental)
 
 on:
-  workflow_dispatch: {}      # manual button for a full backfill
+  workflow_dispatch:
+    inputs:
+      full_scan:
+        description: "Force a FULL scan (ignore watermark)?"
+        type: boolean
+        required: false
+        default: false
+      force_update_all:
+        description: "Force update all rows (ignore Source Hash)?"
+        type: boolean
+        required: false
+        default: false
+      max_pages:
+        description: "Max pages per run (manual trigger only)"
+        required: false
+        default: "999999"
   schedule:
     - cron: "7 * * * *"      # hourly incrementals (UTC)
 
@@ -10,13 +25,13 @@ permissions:
 
 concurrency:
   group: jira-notion-sync
-  cancel-in-progress: true       # ✅ cancel older run when a new one starts
+  cancel-in-progress: true    # cancel older run when a new one starts
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 300         # generous window for full runs
-    environment: prod-secrets    # attaches secrets from this Environment
+    timeout-minutes: 600      # allow long full scans
+    environment: prod-secrets
 
     steps:
       - uses: actions/checkout@v4
@@ -24,19 +39,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"           # speeds up installing from requirements.txt
+          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
 
       - name: Ensure script is present & executable
         run: |
           test -f scripts/sync_jira_notionsrc.py
           chmod +x scripts/sync_jira_notionsrc.py
 
-      # Optional sanity check for secrets
+      # Optional sanity check
       - name: Debug environment vars
         run: |
           echo "Checking secret availability"
@@ -49,8 +64,8 @@ jobs:
           SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
           SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
 
-      # FULL backfill: only when you press "Run workflow"
-      - name: FULL backfill (one-time)
+      # FULL / MANUAL: only when you press "Run workflow"
+      - name: Manual run (with inputs)
         if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
@@ -58,16 +73,17 @@ jobs:
           SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
           SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
 
-          FORCE_FULL_SCAN: '1'
-          FORCE_UPDATE_ALL: '1'
+          # map inputs → flags
+          FORCE_FULL_SCAN: ${{ inputs.full_scan && '1' || '' }}
+          FORCE_UPDATE_ALL: ${{ inputs.force_update_all && '1' || '' }}
 
-          MAX_PAGES_PER_RUN: '999999'
+          # allow overriding max pages via input for manual runs
+          MAX_PAGES_PER_RUN: ${{ inputs.max_pages }}
           PAGE_SIZE: '100'
           BATCH_SIZE: '10'
           SLEEP_SECS: '0.4'
 
-          CHECKPOINT_EVERY_PAGE: '1'   # enables per-page watermark writes
-
+          CHECKPOINT_EVERY_PAGE: '1'
           PYTHONUNBUFFERED: '1'
         run: |
           ( while true; do echo "heartbeat $(date -u +%H:%M:%S)"; sleep 60; done ) &
@@ -77,7 +93,7 @@ jobs:
           kill $HB_PID || true
           exit $RC
 
-      # Incremental: runs on the hourly schedule
+      # SCHEDULED: hourly incrementals
       - name: Incremental (hourly)
         if: ${{ github.event_name != 'workflow_dispatch' }}
         env:
@@ -86,16 +102,15 @@ jobs:
           SYNC_CONTROL_PAGE_ID: ${{ secrets.SYNC_CONTROL_PAGE_ID }}
           SOURCE_DB_IDS: ${{ secrets.SOURCE_DB_IDS }}
 
-          FORCE_FULL_SCAN: ''
-          FORCE_UPDATE_ALL: ''
+          FORCE_FULL_SCAN: ''        # incremental only
+          FORCE_UPDATE_ALL: ''       # update only changed rows
 
-          MAX_PAGES_PER_RUN: '800'     # smaller slices; reliable + resumable
+          MAX_PAGES_PER_RUN: '800'   # smaller slices = reliable + resumable
           PAGE_SIZE: '100'
           BATCH_SIZE: '10'
           SLEEP_SECS: '0.4'
 
-          CHECKPOINT_EVERY_PAGE: '1'   # keep for safe resume
-
+          CHECKPOINT_EVERY_PAGE: '1'
           PYTHONUNBUFFERED: '1'
         run: |
           ( while true; do echo "heartbeat $(date -u +%H:%M:%S)"; sleep 60; done ) &
