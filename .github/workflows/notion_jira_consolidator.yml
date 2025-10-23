@@ -10,13 +10,13 @@ permissions:
 
 concurrency:
   group: jira-notion-sync
-  cancel-in-progress: false       # ← cancel older run when a new one starts
+  cancel-in-progress: true       # ✅ cancel older run when a new one starts
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 300         # ← give the full run room; incrementals will finish sooner anyway
-    environment: prod-secrets    # ← attaches secrets from this Environment
+    timeout-minutes: 300         # generous window for full runs
+    environment: prod-secrets    # attaches secrets from this Environment
 
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"           # ← speed up "Install deps" using requirements.txt
+          cache: "pip"           # speeds up installing from requirements.txt
 
       - name: Install deps
         run: |
@@ -36,7 +36,7 @@ jobs:
           test -f scripts/sync_jira_notionsrc.py
           chmod +x scripts/sync_jira_notionsrc.py
 
-      # (Optional) quick sanity check so you never chase empty secrets again
+      # Optional sanity check for secrets
       - name: Debug environment vars
         run: |
           echo "Checking secret availability"
@@ -66,7 +66,7 @@ jobs:
           BATCH_SIZE: '10'
           SLEEP_SECS: '0.4'
 
-          CHECKPOINT_EVERY_PAGE: '1'   # ← enables per-page watermark writes
+          CHECKPOINT_EVERY_PAGE: '1'   # enables per-page watermark writes
 
           PYTHONUNBUFFERED: '1'
         run: |
@@ -89,12 +89,12 @@ jobs:
           FORCE_FULL_SCAN: ''
           FORCE_UPDATE_ALL: ''
 
-          MAX_PAGES_PER_RUN: '800'     # ← smaller slices; reliable + resumable
+          MAX_PAGES_PER_RUN: '800'     # smaller slices; reliable + resumable
           PAGE_SIZE: '100'
           BATCH_SIZE: '10'
           SLEEP_SECS: '0.4'
 
-          CHECKPOINT_EVERY_PAGE: '1'   # ← keep for safe resume
+          CHECKPOINT_EVERY_PAGE: '1'   # keep for safe resume
 
           PYTHONUNBUFFERED: '1'
         run: |
